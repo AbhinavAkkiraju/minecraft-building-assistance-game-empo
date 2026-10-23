@@ -426,6 +426,104 @@ def make_named_configs(ex: Experiment):
         )
 
     @ex.named_config
+    def empowerment_assistant():
+        """
+        Demonstrates the human-power (empowerment) objective of Heitzig &
+        Potham, arXiv:2508.00159 (see mbag.rllib.alpha_zero.power), instead of
+        the assistance-games/CIRL objective of assistancezero_assistant above.
+        The environment/model/MCTS engineering parameters are unchanged from
+        assistancezero_assistant -- only the objective-specific block differs
+        -- so the two can be compared directly on the same task.
+        """
+
+        run = "MbagAlphaZero"
+        goal_generator = "craftassist"
+        width = 11
+        height = 10
+        depth = 10
+        num_players = 2
+        randomize_first_episode_length = True
+        random_start_locations = True
+        horizon = 1500
+        noop_reward = 0
+        get_resources_reward = 0
+        per_player_action_reward = [0, 0]
+        teleportation = False
+        inf_blocks = True
+
+        num_training_iters = 2000
+        num_workers = 16
+        num_envs_per_worker = 16
+        max_seq_len = 64
+        rollout_fragment_length = max_seq_len
+        sample_batch_size = 16384
+        sample_freq = 4
+        # Train batch size is specified in terms of replay_buffer_storage_unit, i.e.,
+        # sequences.
+        train_batch_size = 256
+        use_replay_buffer = True
+        use_model_replay_buffer = False
+        replay_buffer_storage_unit = "sequences"
+        # Replay buffer capacities are specified in timesteps.
+        replay_buffer_size = 262144
+        num_gpus = 1.0
+        num_gpus_per_worker = 0.12
+        num_sgd_iter = 1
+        batch_mode = "truncate_episodes"
+        model = "convolutional_alpha_zero"
+        filter_size = 5
+        hidden_channels = 64
+        sgd_minibatch_size = 1024
+        num_layers = 8
+        scale_obs = True
+        vf_share_layers = True
+        vf_scale = 1
+        interleave_lstm_every = num_layers // 2
+
+        num_simulations = 100
+        use_bilevel_action_selection = True
+        fix_bilevel_action_selection = True
+        temperature = 1.5
+        dirichlet_noise = 0.25
+        dirichlet_action_subtype_noise_multiplier = 10
+        dirichlet_epsilon = 0.25
+        prior_temperature = 1.0
+        init_q_with_max = False
+        gamma = 0.95
+        lr = 0.001
+        puct_coefficient = 1.0
+        save_freq = 5
+        evaluation_num_workers = 0
+        evaluation_interval = None
+        use_prev_blocks = False
+        mask_goal = True
+        pretrain = False
+
+        # Human-power (empowerment) objective, replacing assistancezero_assistant's
+        # goal_loss_coeff/prev_goal_kl_coeff/use_goal_predictor/mask_goal block.
+        # See mbag.rllib.alpha_zero.power and MbagAlphaZeroConfig.training() for
+        # what each parameter does.
+        use_goal_predictor = False
+        use_power_reward = True
+        use_power_heads = True
+        power_xi = 1.0
+        power_eta = 1.1
+        power_zeta = 2.0
+        power_gamma_h = gamma
+        power_beta_h = 10.0
+        human_goal_ability_loss_coeff = 1.0
+        aggregate_goal_ability_loss_coeff = 1.0
+
+        policies_to_train = ["assistant"]
+        checkpoint_path = None
+        checkpoint_name = ""
+        load_policies_mapping = {"human": "human"}
+        experiment_tag = (
+            f"empowerment_assistant/infinite_blocks_{str(inf_blocks).lower()}/"
+            f"human_{checkpoint_name}"
+        )
+
+    @ex.named_config
     def pretrained_assistant():
         run = "BC"
         inf_blocks = True

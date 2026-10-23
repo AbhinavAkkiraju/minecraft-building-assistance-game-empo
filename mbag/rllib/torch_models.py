@@ -150,6 +150,13 @@ class MbagModelConfig(TypedDict, total=False):
     """Whether to input the last action taken by other agents to the network."""
     goal_agnostic: bool
     """Force goal prediction to be uniform and non-trainable at the final layer."""
+    use_power_heads: bool
+    """
+    Construct the human_goal_ability_head/aggregate_goal_ability_head used by the
+    human-power (empowerment) objective (see mbag.rllib.alpha_zero.power), in
+    addition to the usual action/value/goal heads used by the assistance-games
+    (CIRL) objective.
+    """
 
 
 DEFAULT_CONFIG: MbagModelConfig = {
@@ -173,6 +180,7 @@ DEFAULT_CONFIG: MbagModelConfig = {
     "use_prev_action": False,
     "use_prev_other_agent_action": False,
     "goal_agnostic": False,
+    "use_power_heads": False,
 }
 
 
@@ -241,6 +249,7 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
         self.use_prev_action = extra_config["use_prev_action"]
         self.use_prev_other_agent_action = extra_config["use_prev_other_agent_action"]
         self.goal_agnostic = extra_config["goal_agnostic"]
+        self.use_power_heads = extra_config["use_power_heads"]
 
         self.action_mapping = torch.from_numpy(
             MbagActionDistribution.get_action_mapping(self.env_config)
@@ -273,6 +282,12 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
         self.goal_head = self._construct_goal_head()
         if self.goal_agnostic:
             self._set_goal_head_to_uniform()
+
+        if self.use_power_heads:
+            self.human_goal_ability_head = self._construct_human_goal_ability_head()
+            self.aggregate_goal_ability_head = (
+                self._construct_aggregate_goal_ability_head()
+            )
 
         if self.use_per_location_lstm:
             assert self.vf_share_layers
@@ -445,6 +460,47 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
             if bias is not None:
                 bias.zero_()
                 bias.requires_grad_(False)
+
+    def _construct_human_goal_ability_head(self) -> nn.Module:
+        """
+        Construct the head for V_h^e(s, g_h) (see mbag.rllib.alpha_zero.power),
+        the human's expected discounted probability of achieving a hypothetical
+        possible goal g_h. Unlike the other heads, this one is conditioned on an
+        extra input -- an embedding of g_h's target structure, concatenated onto
+        the shared backbone output -- since g_h varies per call (it is a sampled
+        possible goal, not the environment's one true, usually-masked goal); see
+        human_goal_ability().
+        """
+
+        return nn.Sequential(
+            Conv3d1x1x1(self._get_head_in_channels() + self.embedding_size, self.hidden_size),
+            nn.LeakyReLU(),
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(self.hidden_size, 1),
+            nn.Sigmoid(),
+        )
+
+    def _construct_aggregate_goal_ability_head(self) -> nn.Module:
+        """
+        Construct the head for X_h(s) = E_g[V_h^e(s, g)^zeta] (see
+        mbag.rllib.alpha_zero.power), amortizing the per-goal sampling that
+        human_goal_ability_head requires so that planning doesn't need one
+        forward pass per sampled goal at every node. Trained via Monte Carlo
+        targets built from human_goal_ability_head's own predictions (see
+        mbag.rllib.alpha_zero.power.formulas.aggregate_goal_ability). Softplus
+        keeps the output strictly positive, since X_h appears raised to a
+        negative power (-xi) when computing U_r.
+        """
+
+        return nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(self._get_head_in_channels(), self.hidden_size),
+            nn.LeakyReLU(),
+            nn.Linear(self.hidden_size, 1),
+            nn.Softplus(),
+        )
 
     def _get_embedded_actions(
         self,
@@ -758,6 +814,45 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
         with self._amp_or_nothing:
             goal_preds: torch.Tensor = self.goal_head(self._backbone_out)
         return goal_preds.float()
+
+    def human_goal_ability(self, possible_goal_blocks: torch.Tensor) -> torch.Tensor:
+        """
+        V_h^e(s, g_h) for a batch of hypothetical possible goals (see
+        mbag.rllib.alpha_zero.power). Must be called after forward(), since it
+        reuses the cached shared backbone output.
+
+        Args:
+            possible_goal_blocks: Long tensor of shape
+                (batch_size, width, height, depth) giving block ids of a
+                hypothetical target structure per batch element -- encoded the
+                same way as the true GOAL_BLOCKS observation channel (see
+                mbag.environment.goals.possible_goals.MinecraftStructureGoal).
+
+        Returns:
+            Tensor of shape (batch_size,), each entry in (0, 1).
+        """
+        assert self.use_power_heads
+        with self._amp_or_nothing:
+            embedded_goal = self.block_id_embedding(
+                possible_goal_blocks.to(self.device).long()
+            ).permute(0, 4, 1, 2, 3)
+            head_input = torch.cat([self._backbone_out, embedded_goal], dim=1)
+            v_h_e: torch.Tensor = self.human_goal_ability_head(head_input)
+        return v_h_e.float().squeeze(1)
+
+    def aggregate_goal_ability(self) -> torch.Tensor:
+        """
+        X_h(s) for the current batch (see mbag.rllib.alpha_zero.power). Must be
+        called after forward(), since it reuses the cached shared backbone
+        output.
+
+        Returns:
+            Tensor of shape (batch_size,), each entry strictly positive.
+        """
+        assert self.use_power_heads
+        with self._amp_or_nothing:
+            x_h: torch.Tensor = self.aggregate_goal_ability_head(self._backbone_out)
+        return x_h.float().squeeze(1)
 
     def get_initial_state(self):
         state: List[TensorType]

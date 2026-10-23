@@ -10,12 +10,15 @@ from ray.rllib.utils.numpy import convert_to_numpy
 from mbag.agents.action_distributions import MbagActionDistribution
 from mbag.environment.actions import MbagAction, MbagActionTuple
 from mbag.environment.blocks import MinecraftBlocks
+from mbag.environment.goals.possible_goals import PossibleGoalSampler
 from mbag.environment.schedule import PiecewiseSchedule, Schedule
 from mbag.environment.types import MbagObs
 
 from ..rllib_env import unwrap_mbag_env
 from ..torch_models import MbagTorchModel, OtherAgentActionPredictorMixin
 from .planning import MbagEnvModel, MbagEnvModelInfoDict
+from .power.human_policy_prior import HumanPolicyPrior
+from .power.planning import get_power_reward
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +142,7 @@ class MbagMCTSNode:
         self.dirichlet_noise = None
 
         self.goal_logits = None
+        self.aggregate_goal_ability: Optional[float] = None
         self.other_agent_action_dist = None
 
         self._total_value = 0.0
@@ -394,6 +398,7 @@ class MbagMCTSNode:
         child_priors,
         value_estimate: float,
         goal_logits: Optional[np.ndarray] = None,
+        aggregate_goal_ability: Optional[float] = None,
         other_agent_action_dist: Optional[np.ndarray] = None,
         model_state_out: List[torch.Tensor] = [],
         add_dirichlet_noise=False,
@@ -404,21 +409,29 @@ class MbagMCTSNode:
 
         self.model_state_out = model_state_out
         self.goal_logits = goal_logits
+        self.aggregate_goal_ability = aggregate_goal_ability
         self.other_agent_action_dist = other_agent_action_dist
 
-        if (
-            self.info is not None
-            and self.goal_logits is not None
-            and isinstance(self.parent, MbagMCTSNode)
-        ):
-            # We need to update the reward for this node based on the new goal_logits.
-            self.reward = self.env.get_reward_with_other_agent_actions(
-                self.parent.obs,
-                self.info,
-                self.goal_logits,
-                update_own_reward=self.mcts.predict_goal_using_next_state,
-                average_own_reward=self.mcts.predict_goal_using_average,
-            )
+        if self.info is not None and isinstance(self.parent, MbagMCTSNode):
+            if self.goal_logits is not None:
+                # We need to update the reward for this node based on the new
+                # goal_logits (CIRL/assistance-games objective).
+                self.reward = self.env.get_reward_with_other_agent_actions(
+                    self.parent.obs,
+                    self.info,
+                    self.goal_logits,
+                    update_own_reward=self.mcts.predict_goal_using_next_state,
+                    average_own_reward=self.mcts.predict_goal_using_average,
+                )
+            elif self.aggregate_goal_ability is not None:
+                # Human-power (empowerment) objective: reward is U_r(s'), a pure
+                # function of this state's aggregate goal ability X_h(s') -- no
+                # goal belief or own/joint-reward blending involved.
+                self.reward = get_power_reward(
+                    self.aggregate_goal_ability,
+                    xi=self.mcts.power_xi,
+                    eta=self.mcts.power_eta,
+                )
 
         self.child_priors[~self.valid_actions] = 0
         self.child_priors /= self.child_priors.sum()
@@ -644,6 +657,9 @@ class MbagMCTS(MCTS):
         gamma: float,
         use_critic=True,
         use_goal_predictor=True,
+        use_power_reward=False,
+        power_human_policy_prior: Optional[HumanPolicyPrior] = None,
+        power_possible_goal_sampler: Optional[PossibleGoalSampler] = None,
         use_other_agent_action_predictor=True,
         _strict_mode=False,
     ):
@@ -651,6 +667,16 @@ class MbagMCTS(MCTS):
         self.gamma = gamma  # Discount factor.
         self.use_critic = use_critic
         self.use_goal_predictor = use_goal_predictor
+        self.use_power_reward = use_power_reward
+        self.power_xi: float = mcts_param.get("power_xi", 1.0)
+        self.power_eta: float = mcts_param.get("power_eta", 1.0)
+        # Used to simulate the human during tree search when use_power_reward
+        # is True: a fresh possible goal is sampled per compute_actions() call
+        # and fed to power_human_policy_prior to get other_agent_action_dist,
+        # replacing the CIRL-trained OtherAgentActionPredictorMixin for that
+        # purpose (see compute_actions below).
+        self.power_human_policy_prior = power_human_policy_prior
+        self.power_possible_goal_sampler = power_possible_goal_sampler
         self.use_other_agent_action_predictor = use_other_agent_action_predictor
         self._strict_mode = _strict_mode
 
@@ -797,8 +823,39 @@ class MbagMCTS(MCTS):
             else:
                 goal_logits = None
 
+            aggregate_goal_abilities: Optional[np.ndarray]
+            if self.use_power_reward:
+                aggregate_goal_abilities = convert_to_numpy(
+                    self.model.aggregate_goal_ability()
+                )
+            else:
+                aggregate_goal_abilities = None
+
             other_agent_action_dists: Optional[np.ndarray] = None
-            if isinstance(self.model, OtherAgentActionPredictorMixin):
+            if (
+                self.use_power_reward
+                and self.power_human_policy_prior is not None
+                and self.power_possible_goal_sampler is not None
+            ):
+                # Simulate the human during tree search using the Phase-1/2
+                # human policy prior (see mbag.rllib.alpha_zero.power),
+                # rather than a CIRL-trained action predictor. A fresh
+                # possible goal is sampled per compute_actions() call.
+                assert isinstance(self.model, MbagTorchModel)
+                env_config = self.model.env_config
+                possible_goal, _ = self.power_possible_goal_sampler.sample(None, 0)
+                other_agent_action_dists = np.stack(
+                    [
+                        MbagActionDistribution.to_flat(
+                            env_config,
+                            self.power_human_policy_prior.action_distribution(
+                                leaf_obs, possible_goal
+                            )[None],
+                        )[0]
+                        for leaf_obs in obs
+                    ]
+                )
+            elif isinstance(self.model, OtherAgentActionPredictorMixin):
                 other_agent_action_dists = convert_to_numpy(
                     self.model.predict_other_agent_action().softmax(1)
                 )
@@ -813,6 +870,11 @@ class MbagMCTS(MCTS):
                         value_estimate=value,
                         goal_logits=(
                             goal_logits[env_index] if goal_logits is not None else None
+                        ),
+                        aggregate_goal_ability=(
+                            float(aggregate_goal_abilities[env_index])
+                            if aggregate_goal_abilities is not None
+                            else None
                         ),
                         other_agent_action_dist=(
                             other_agent_action_dists[env_index]

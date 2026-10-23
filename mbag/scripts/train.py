@@ -362,6 +362,17 @@ def sacred_config(_log):  # noqa
     model_train_batch_size = train_batch_size
     use_critic = True
     use_goal_predictor = True
+    # Human-power (empowerment) objective (see mbag.rllib.alpha_zero.power), an
+    # alternative to the assistance-games/CIRL objective above; both remain
+    # independently runnable. See the empowerment_assistant named config.
+    use_power_reward = False
+    power_xi = 1.0
+    power_eta = 1.0
+    power_gamma_h = gamma
+    power_zeta = 2.0
+    power_beta_h = 10.0
+    human_goal_ability_loss_coeff = 1.0
+    aggregate_goal_ability_loss_coeff = 1.0
     use_other_agent_action_predictor = True
     other_agent_action_predictor_loss_coeff = 1.0
     reward_scale = 1.0
@@ -417,6 +428,7 @@ def sacred_config(_log):  # noqa
     position_embedding_size = 48
     position_embedding_angle = 10
     mask_goal = False
+    use_power_heads = False
     num_inventory_obs = num_players
     mask_other_players = num_players == 1
     use_extra_features = not mask_goal
@@ -492,6 +504,7 @@ def sacred_config(_log):  # noqa
             "interleave_lstm_every": interleave_lstm_every,
             "lstm_size": lstm_size,
             "goal_agnostic": goal_agnostic,
+            "use_power_heads": use_power_heads,
         }
         model_config["custom_model_config"] = conv_config
     elif "transformer" in model:
@@ -523,6 +536,7 @@ def sacred_config(_log):  # noqa
             "scale_obs": scale_obs,
             "vf_scale": vf_scale,
             "goal_agnostic": goal_agnostic,
+            "use_power_heads": use_power_heads,
         }
         model_config["custom_model_config"] = transformer_config
     elif "unet" in model:
@@ -554,6 +568,7 @@ def sacred_config(_log):  # noqa
             "use_lstm": use_lstm,
             "lstm_size": lstm_size,
             "goal_agnostic": goal_agnostic,
+            "use_power_heads": use_power_heads,
         }
         model_config["custom_model_config"] = unet_config
 
@@ -862,6 +877,14 @@ def sacred_config(_log):  # noqa
             use_other_agent_action_predictor=use_other_agent_action_predictor,
             expected_own_reward_scale=expected_own_reward_scale,
             expected_reward_shift=expected_reward_shift,
+            use_power_reward=use_power_reward,
+            power_xi=power_xi,
+            power_eta=power_eta,
+            power_gamma_h=power_gamma_h,
+            power_zeta=power_zeta,
+            power_beta_h=power_beta_h,
+            human_goal_ability_loss_coeff=human_goal_ability_loss_coeff,
+            aggregate_goal_ability_loss_coeff=aggregate_goal_ability_loss_coeff,
             other_agent_action_predictor_loss_coeff=other_agent_action_predictor_loss_coeff,
             use_replay_buffer=use_replay_buffer,
             replay_buffer_config={

@@ -30,8 +30,19 @@ from torch import nn
 
 from mbag.environment.blocks import MinecraftBlocks
 from mbag.environment.config import MbagConfigDict
+from mbag.environment.goals import ALL_GOAL_GENERATORS
+from mbag.environment.goals.possible_goals import (
+    MinecraftStructureGoal,
+    RandomStructurePossibleGoalSampler,
+)
 from mbag.environment.state import MbagStateDict
-from mbag.environment.types import CURRENT_BLOCKS, GOAL_BLOCKS, MbagInfoDict, WorldSize
+from mbag.environment.types import (
+    CURRENT_BLOCK_STATES,
+    CURRENT_BLOCKS,
+    GOAL_BLOCKS,
+    MbagInfoDict,
+    WorldSize,
+)
 
 from ..kl_regularization import ANCHOR_POLICY_ACTION_DIST_INPUTS
 from ..rllib_env import unwrap_mbag_env
@@ -43,6 +54,8 @@ from ..torch_models import (
 )
 from .mcts import MbagMCTS, MbagMCTSNode, MbagRootParentNode
 from .planning import MbagEnvModel
+from .power.formulas import human_goal_ability_monte_carlo_targets
+from .power.human_policy_prior import HeuristicMbagHumanPolicyPrior
 
 ENV_STATES = "env_states"
 PRIOR_POLICIES = "prior_policies"
@@ -54,6 +67,9 @@ EXPECTED_OWN_REWARDS = "expected_own_rewards"
 VALUE_ESTIMATES = "value_estimates"
 GOAL_LOGITS = "goal_logits"
 PREV_GOAL_KL_COEFF = "prev_goal_kl_coeff"
+POSSIBLE_GOAL_BLOCKS = "possible_goal_blocks"
+HUMAN_GOAL_ABILITY_TARGETS = "human_goal_ability_targets"
+AGGREGATE_GOAL_ABILITY_TARGETS = "aggregate_goal_ability_targets"
 FORCE_NOOP = "force_noop"
 C_PUCT = "c_puct"
 PREV_C_PUCT = "prev_c_puct"
@@ -94,12 +110,17 @@ class MbagAlphaZeroPolicy(
         assert isinstance(model, MbagTorchModel)
         line_of_sight_masking = model.line_of_sight_masking
 
+        self.use_power_reward: bool = config.get("use_power_reward", False)
+        mcts_config = dict(config["mcts_config"])
+        mcts_config.setdefault("power_xi", config.get("power_xi", 1.0))
+        mcts_config.setdefault("power_eta", config.get("power_eta", 1.0))
         self.mcts = MbagMCTS(
             self.model,
-            config["mcts_config"],
+            mcts_config,
             config["gamma"],
             use_critic=config["use_critic"],
             use_goal_predictor=config["use_goal_predictor"],
+            use_power_reward=self.use_power_reward,
             use_other_agent_action_predictor=config.get(
                 "use_other_agent_action_predictor", True
             ),
@@ -176,6 +197,62 @@ class MbagAlphaZeroPolicy(
                     high=np.inf,
                     shape=(MinecraftBlocks.NUM_BLOCKS,) + world_size,
                 )
+            )
+
+        # Defaults so loss() can reference these unconditionally; overridden
+        # below (to nonzero defaults) only when the power objective is active.
+        self.human_goal_ability_loss_coeff: float = 0.0
+        self.aggregate_goal_ability_loss_coeff: float = 0.0
+
+        if self.use_power_reward:
+            env_config = config["env_config"]
+            goal_generator_cls = env_config["goal_generator"]
+            if isinstance(goal_generator_cls, str):
+                goal_generator_cls = ALL_GOAL_GENERATORS[goal_generator_cls]
+            goal_generator = goal_generator_cls(
+                env_config.get("goal_generator_config", {})
+            )
+            # One possible goal g_h is sampled per trajectory fragment (not per
+            # timestep), independently of the true goal, so that V_h^e(s_t, g_h)
+            # forms a valid TD sequence across the fragment (see
+            # postprocess_trajectory).
+            self.power_possible_goal_sampler = RandomStructurePossibleGoalSampler(
+                goal_generator, world_size
+            )
+            self.power_gamma_h: float = config.get("power_gamma_h", config["gamma"])
+            self.power_zeta: float = config.get("power_zeta", 2.0)
+            self.human_goal_ability_loss_coeff = config.get(
+                "human_goal_ability_loss_coeff", 1.0
+            )
+            self.aggregate_goal_ability_loss_coeff = config.get(
+                "aggregate_goal_ability_loss_coeff", 1.0
+            )
+            self.power_human_policy_prior = HeuristicMbagHumanPolicyPrior(
+                config["env_config"], beta_h=config.get("power_beta_h", 10.0)
+            )
+            # MbagMCTS was constructed above (before world_size/env_config were
+            # available here); attach the human policy prior and possible-goal
+            # sampler it needs to simulate the human during tree search.
+            self.mcts.power_human_policy_prior = self.power_human_policy_prior
+            self.mcts.power_possible_goal_sampler = self.power_possible_goal_sampler
+
+            # These three columns are only ever written in
+            # _add_power_training_columns (called from postprocess_trajectory,
+            # after a full trajectory fragment is collected) -- never per-step
+            # during compute_actions_from_input_dict, unlike e.g. GOAL_LOGITS.
+            # used_for_compute_actions=False stops RLlib's action-time
+            # connector from expecting a per-step buffered value for them.
+            self.view_requirements[POSSIBLE_GOAL_BLOCKS] = ViewRequirement(
+                space=spaces.Box(low=0, high=255, shape=world_size, dtype=np.uint8),
+                used_for_compute_actions=False,
+            )
+            self.view_requirements[HUMAN_GOAL_ABILITY_TARGETS] = ViewRequirement(
+                space=spaces.Box(low=0, high=1, shape=()),
+                used_for_compute_actions=False,
+            )
+            self.view_requirements[AGGREGATE_GOAL_ABILITY_TARGETS] = ViewRequirement(
+                space=spaces.Box(low=0, high=np.inf, shape=()),
+                used_for_compute_actions=False,
             )
 
         self.view_requirements[C_PUCT] = ViewRequirement(
@@ -606,6 +683,83 @@ class MbagAlphaZeroPolicy(
 
         return np.array(actions), state_out, extra_out
 
+    def _add_power_training_columns(
+        self,
+        sample_batch: SampleBatch,
+        last_input_dict: Optional[SampleBatch],
+        terminated: bool,
+    ) -> None:
+        """
+        Sample one possible goal g_h for this trajectory fragment (see
+        mbag.rllib.alpha_zero.power) and compute Monte Carlo regression
+        targets for V_h^e(s_t, g_h) and X_h(s_t) at each timestep, mirroring
+        how VALUE_TARGETS above bootstraps V_r with the model's own value
+        prediction at the truncation boundary.
+
+        If the fragment ends in true termination (not just truncation),
+        there is no observed successor state past the last transition to
+        check goal achievement against, so -- exactly like VALUE_TARGETS'
+        last_r=0 convention -- that one boundary transition's achievement and
+        bootstrap value are both treated as 0. This is a documented
+        approximation affecting at most one timestep per completed episode.
+        """
+        assert self.model is not None
+        possible_goal, _ = self.power_possible_goal_sampler.sample(None, 0)
+        assert isinstance(possible_goal, MinecraftStructureGoal)
+        target_blocks = possible_goal.target.blocks
+
+        # sample_batch[SampleBatch.OBS] may already be a torch tensor by this
+        # point depending on the connector pipeline in use, even though
+        # tensorlib="numpy" is requested below -- restore_original_dimensions
+        # reshapes but doesn't necessarily cast, so force numpy explicitly.
+        world_obs, _, _ = restore_original_dimensions(
+            convert_to_numpy(sample_batch[SampleBatch.OBS]), self.obs_space, "numpy"
+        )
+        # achieved[t] for t = 0..T-2 is whether g_h is achieved in the state
+        # reached after timestep t's action, i.e. OBS[t + 1].
+        achieved = possible_goal.matches_blocks(
+            world_obs[1:, CURRENT_BLOCKS], world_obs[1:, CURRENT_BLOCK_STATES]
+        ).astype(np.float32)
+
+        last_achieved: float
+        last_human_goal_ability: float
+        if terminated:
+            last_achieved = 0.0
+            last_human_goal_ability = 0.0
+        else:
+            assert last_input_dict is not None
+            last_world_obs, _, _ = restore_original_dimensions(
+                convert_to_numpy(last_input_dict[SampleBatch.OBS]),
+                self.obs_space,
+                "numpy",
+            )
+            last_achieved = float(
+                possible_goal.matches_blocks(
+                    last_world_obs[0, CURRENT_BLOCKS],
+                    last_world_obs[0, CURRENT_BLOCK_STATES],
+                )
+            )
+            target_blocks_tensor = torch.from_numpy(target_blocks[None]).to(
+                self.model.device
+            )
+            last_human_goal_ability = float(
+                self.model.human_goal_ability(target_blocks_tensor)[0].item()
+            )
+
+        achieved = np.concatenate([achieved, [last_achieved]])
+        v_h_e_targets = human_goal_ability_monte_carlo_targets(
+            achieved,
+            gamma_h=self.power_gamma_h,
+            bootstrap_v_h_e=last_human_goal_ability,
+        ).astype(np.float32)
+        x_h_targets = (v_h_e_targets**self.power_zeta).astype(np.float32)
+
+        sample_batch[POSSIBLE_GOAL_BLOCKS] = np.repeat(
+            target_blocks[None], len(sample_batch), axis=0
+        )
+        sample_batch[HUMAN_GOAL_ABILITY_TARGETS] = v_h_e_targets
+        sample_batch[AGGREGATE_GOAL_ABILITY_TARGETS] = x_h_targets
+
     def postprocess_trajectory(
         self,
         sample_batch: SampleBatch,
@@ -616,7 +770,9 @@ class MbagAlphaZeroPolicy(
     ):
         with torch.no_grad():
             last_r: float
-            if sample_batch[SampleBatch.TERMINATEDS][-1]:
+            terminated = sample_batch[SampleBatch.TERMINATEDS][-1]
+            input_dict: Optional[SampleBatch] = None
+            if terminated:
                 last_r = 0
             else:
                 input_dict = sample_batch.get_single_step_input_dict(
@@ -633,6 +789,9 @@ class MbagAlphaZeroPolicy(
                 :-1
             ].astype(np.float32)
             sample_batch[Postprocessing.VALUE_TARGETS] = discounted_returns
+
+            if self.use_power_reward:
+                self._add_power_training_columns(sample_batch, input_dict, terminated)
 
         if other_agent_batches is not None:
             if len(other_agent_batches) > 1:
@@ -793,11 +952,37 @@ class MbagAlphaZeroPolicy(
             prev_goal_kl = reduce_mean_model(prev_goal_kl)
             weighted_prev_goal_kl = reduce_mean_model(weighted_prev_goal_kl)
 
+        # Compute human-power (empowerment) objective losses: TD regressions
+        # for V_h^e and X_h against the Monte Carlo targets computed in
+        # postprocess_trajectory (see mbag.rllib.alpha_zero.power). Absent
+        # (POSSIBLE_GOAL_BLOCKS not in train_batch) whenever use_power_reward
+        # is False, so this is a no-op for the CIRL/assistance-games objective.
+        human_goal_ability_loss: torch.Tensor = torch.tensor(
+            0.0, device=policy_loss.device
+        )
+        aggregate_goal_ability_loss: torch.Tensor = torch.tensor(
+            0.0, device=policy_loss.device
+        )
+        if POSSIBLE_GOAL_BLOCKS in train_batch:
+            predicted_v_h_e = model.human_goal_ability(
+                cast(torch.Tensor, train_batch[POSSIBLE_GOAL_BLOCKS])
+            )
+            human_goal_ability_loss = reduce_mean_model(
+                (predicted_v_h_e - train_batch[HUMAN_GOAL_ABILITY_TARGETS]) ** 2
+            )
+
+            predicted_x_h = model.aggregate_goal_ability()
+            aggregate_goal_ability_loss = reduce_mean_model(
+                (predicted_x_h - train_batch[AGGREGATE_GOAL_ABILITY_TARGETS]) ** 2
+            )
+
         # Compute total loss.
         total_loss: torch.Tensor = (
             self.config["vf_loss_coeff"] * value_loss
             + self.config["goal_loss_coeff"] * goal_loss
             + weighted_prev_goal_kl
+            + self.human_goal_ability_loss_coeff * human_goal_ability_loss
+            + self.aggregate_goal_ability_loss_coeff * aggregate_goal_ability_loss
             - self.entropy_coeff * entropy
         )
         if not self.config["pretrain"]:
@@ -869,6 +1054,10 @@ class MbagAlphaZeroPolicy(
             unplaced_blocks_goal_loss.detach()
         )
         model.tower_stats["entropy"] = entropy.detach()
+        model.tower_stats["human_goal_ability_loss"] = human_goal_ability_loss.detach()
+        model.tower_stats["aggregate_goal_ability_loss"] = (
+            aggregate_goal_ability_loss.detach()
+        )
 
         return total_loss
 
@@ -892,6 +1081,8 @@ class MbagAlphaZeroPolicy(
             "weighted_prev_goal_kl",
             "unplaced_blocks_goal_loss",
             "entropy",
+            "human_goal_ability_loss",
+            "aggregate_goal_ability_loss",
             "other_agent_action_predictor_loss",
             "anchor_policy_kl",
         ]:

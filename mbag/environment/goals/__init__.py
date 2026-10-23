@@ -7,6 +7,14 @@ from .filters import DensityFilter, MinSizeFilter, SingleConnectedComponentFilte
 from .goal_generator import GoalGenerator, GoalGeneratorConfig
 from .goal_transform import GoalTransform, TransformedGoalGenerator
 from .grabcraft import GrabcraftGoalGenerator
+from .possible_goals import (
+    MinecraftStructureGoal,
+    PossibleGoal,
+    PossibleGoalGenerator,
+    PossibleGoalSampler,
+    RandomStructurePossibleGoalGenerator,
+    RandomStructurePossibleGoalSampler,
+)
 from .simple import (
     BasicGoalGenerator,
     RandomGoalGenerator,
@@ -71,4 +79,10 @@ __all__ = [
     "RandomGoalGenerator",
     "GrabcraftGoalGenerator",
     "CraftAssistGoalGenerator",
+    "PossibleGoal",
+    "PossibleGoalSampler",
+    "PossibleGoalGenerator",
+    "MinecraftStructureGoal",
+    "RandomStructurePossibleGoalSampler",
+    "RandomStructurePossibleGoalGenerator",
 ]

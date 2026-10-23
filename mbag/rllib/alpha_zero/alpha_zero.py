@@ -78,6 +78,29 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
         self.use_other_agent_action_predictor = True
         self.expected_own_reward_scale = 1.0
         self.expected_reward_shift = 0.0
+        # Human-power (empowerment) objective (see mbag.rllib.alpha_zero.power),
+        # an alternative to the assistance-games/CIRL objective above -- set
+        # use_power_reward=True (and use_goal_predictor=False, and
+        # use_power_heads=True in the model config) to switch to it. Both
+        # objectives remain independently runnable; see the
+        # empowerment_assistant named config alongside assistancezero_assistant
+        # in mbag/scripts/train_configs.py.
+        self.use_power_reward = False
+        self.power_xi = 1.0
+        """Inter-human inequality aversion exponent (xi) in U_r's Pigou-Dalton
+        aggregation; irrelevant with a single human (MBAG's standard setup)."""
+        self.power_eta = 1.0
+        """Intertemporal inequality aversion exponent (eta) in U_r = -y^eta."""
+        self.power_gamma_h = 0.99
+        """Human's discount factor, used in V_h^e's TD targets."""
+        self.power_zeta = 2.0
+        """Risk/reliability aversion exponent (zeta) in X_h = E_g[V_h^e^zeta]."""
+        self.power_beta_h = 10.0
+        """Inverse temperature of the heuristic human policy prior used to
+        simulate the human during MCTS tree search (see
+        HeuristicMbagHumanPolicyPrior)."""
+        self.human_goal_ability_loss_coeff = 1.0
+        self.aggregate_goal_ability_loss_coeff = 1.0
         self.use_replay_buffer = True
         self.num_steps_sampled_before_learning_starts: int = 0
         self.anchor_policy_mapping: Mapping[PolicyID, PolicyID] = {}
@@ -111,6 +134,14 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
         use_other_agent_action_predictor=NotProvided,
         expected_own_reward_scale=NotProvided,
         expected_reward_shift=NotProvided,
+        use_power_reward=NotProvided,
+        power_xi=NotProvided,
+        power_eta=NotProvided,
+        power_gamma_h=NotProvided,
+        power_zeta=NotProvided,
+        power_beta_h=NotProvided,
+        human_goal_ability_loss_coeff=NotProvided,
+        aggregate_goal_ability_loss_coeff=NotProvided,
         use_replay_buffer=NotProvided,
         num_steps_sampled_before_learning_starts=NotProvided,
         anchor_policy_mapping=NotProvided,
@@ -161,6 +192,19 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
                 this value before being used for planning.
             expected_reward_shift (float): The expected reward is shifted by this
                 value before being used for planning.
+            use_power_reward (bool): Whether to use the human-power (empowerment)
+                objective's U_r-based MCTS reward instead of the CIRL
+                belief-weighted reward (see mbag.rllib.alpha_zero.power).
+            power_xi (float): Inter-human inequality aversion exponent.
+            power_eta (float): Intertemporal inequality aversion exponent.
+            power_gamma_h (float): Human's discount factor for V_h^e.
+            power_zeta (float): Risk/reliability aversion exponent for X_h.
+            power_beta_h (float): Inverse temperature of the heuristic human
+                policy prior used to simulate the human during tree search.
+            human_goal_ability_loss_coeff (float): Coefficient of the V_h^e
+                regression loss.
+            aggregate_goal_ability_loss_coeff (float): Coefficient of the X_h
+                regression loss.
             use_replay_buffer (bool): Whether to use a replay buffer.
             num_steps_sampled_before_learning_starts (int): Number of steps
                 collected before learning starts.
@@ -221,6 +265,22 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
             self.expected_own_reward_scale = expected_own_reward_scale
         if expected_reward_shift is not NotProvided:
             self.expected_reward_shift = expected_reward_shift
+        if use_power_reward is not NotProvided:
+            self.use_power_reward = use_power_reward
+        if power_xi is not NotProvided:
+            self.power_xi = power_xi
+        if power_eta is not NotProvided:
+            self.power_eta = power_eta
+        if power_gamma_h is not NotProvided:
+            self.power_gamma_h = power_gamma_h
+        if power_zeta is not NotProvided:
+            self.power_zeta = power_zeta
+        if power_beta_h is not NotProvided:
+            self.power_beta_h = power_beta_h
+        if human_goal_ability_loss_coeff is not NotProvided:
+            self.human_goal_ability_loss_coeff = human_goal_ability_loss_coeff
+        if aggregate_goal_ability_loss_coeff is not NotProvided:
+            self.aggregate_goal_ability_loss_coeff = aggregate_goal_ability_loss_coeff
         if use_replay_buffer is not NotProvided:
             self.use_replay_buffer = use_replay_buffer
         if num_steps_sampled_before_learning_starts is not NotProvided:
