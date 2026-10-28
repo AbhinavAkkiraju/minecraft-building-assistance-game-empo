@@ -13,7 +13,9 @@ aggregate_goal_ability_head (see mbag.rllib.torch_models.MbagTorchModel).
 from mbag.rllib.alpha_zero.power.formulas import robot_intrinsic_reward
 
 
-def get_power_reward(aggregate_goal_ability: float, xi: float, eta: float) -> float:
+def get_power_reward(
+    aggregate_goal_ability: float, xi: float, eta: float, epsilon_x: float = 0.0
+) -> float:
     """
     U_r(s') for a successor state, given the model's prediction of that
     state's aggregate goal ability X_h(s').
@@ -23,5 +25,8 @@ def get_power_reward(aggregate_goal_ability: float, xi: float, eta: float) -> fl
     reduces to the one human's aggregate goal ability. The general sum-over-
     humans form lives in robot_intrinsic_reward itself so this still behaves
     correctly if MBAG is ever run with more than one human.
+
+    ``epsilon_x`` is the paper's epsilon_X (Appendix H.1): a small constant added to
+    X_h before taking the -xi power, so that U_r stays bounded when X_h is near 0.
     """
-    return robot_intrinsic_reward([aggregate_goal_ability], xi=xi, eta=eta)
+    return robot_intrinsic_reward([aggregate_goal_ability + epsilon_x], xi=xi, eta=eta)

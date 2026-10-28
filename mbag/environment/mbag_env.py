@@ -20,6 +20,7 @@ from .config import (
     RewardsConfigDict,
 )
 from .goals import ALL_GOAL_GENERATORS
+from .goals.embedding import embed_goal
 from .malmo.ai_actions import (
     MalmoGiveAIAction,
     MalmoMoveAIAction,
@@ -422,30 +423,11 @@ class MbagEnv(object):
 
         small_goal = self.goal_generator.generate_goal(goal_size)
 
-        goal = self.current_blocks.copy()
-
-        shape = small_goal.size
-
-        # Choose a uniformly random x offset in the valid range [1, usable_x-shape[0]-1].
-        max_x_offset = usable_x - shape[0] - 1
-        if max_x_offset >= 1:
-            x_offset = random.randint(1, max_x_offset)
-        else:
-            x_offset = 1
-
-        goal.blocks[
-            x_offset : x_offset + shape[0], 1 : shape[1] + 1, 1 : shape[2] + 1
-        ] = small_goal.blocks
-        goal.block_states[
-            x_offset : x_offset + shape[0], 1 : shape[1] + 1, 1 : shape[2] + 1
-        ] = small_goal.block_states
-
-        if not self.config["abilities"]["inf_blocks"]:
-            for index, block in enumerate(MinecraftBlocks.PLACEABLE_BLOCK_IDS):
-                if index >= world_size[2]:
-                    break
-                goal.blocks[self.palette_x, 2, index] = block
-                goal.block_states[self.palette_x, 2, index] = 0
+        # Shared with the human-power possible-goal sampler so both build goals the
+        # same way (see mbag.environment.goals.embedding).
+        goal = embed_goal(
+            small_goal, world_size, self.config["abilities"]["inf_blocks"]
+        )
 
         # logger.debug(goal.blocks)
         return goal
@@ -669,6 +651,16 @@ class MbagEnv(object):
         return reward, info
 
     def _handle_place_break(self, player_index: int, action: MbagAction) -> bool:
+        # Humans can neither break bedrock nor place over it. try_break_place enforces
+        # this too, but it is not passed is_human when teleportation is enabled, so
+        # check here to cover both code paths.
+        if (
+            self.config["players"][player_index]["is_human"]
+            and self.current_blocks.blocks[action.block_location]
+            == MinecraftBlocks.BEDROCK
+        ):
+            return False
+
         # Check if the player can give/receive the block.
         if not self.config["abilities"]["inf_blocks"]:
             if action.action_type == MbagAction.PLACE_BLOCK:

@@ -20,13 +20,14 @@ exactly rather than MBAG's own graded block-similarity score.
 """
 
 from abc import ABC, abstractmethod
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
 import numpy as np
 
 from ..blocks import MinecraftBlocks
 from ..state import MbagStateDict
 from ..types import WorldSize
+from .embedding import embed_goal, get_goal_size
 from .goal_generator import GoalGenerator
 
 
@@ -50,16 +51,28 @@ class PossibleGoal(ABC):
 
 class MinecraftStructureGoal(PossibleGoal):
     """
-    A possible goal defined by an exact target structure: achieved iff the
-    current build matches ``target`` block-for-block, including block states.
+    A possible goal defined by a target structure.
+
+    By default it is achieved iff the current build matches ``target``
+    block-for-block over the whole world, including block states. With
+    ``lenient=True`` it is achieved iff every cell where ``target`` has a block
+    holds that block (with the same block state), and the rest of the world --
+    e.g. bedrock clutter or stray blocks elsewhere -- is ignored. This treats a
+    goal as the event "this structure is built" rather than a single world state.
     """
 
-    def __init__(self, target: MinecraftBlocks):
+    def __init__(self, target: MinecraftBlocks, lenient: bool = False):
         self.target = target
-        self._hash = hash((target.blocks.tobytes(), target.block_states.tobytes()))
+        self.lenient = lenient
+        self._hash = hash(
+            (target.blocks.tobytes(), target.block_states.tobytes(), lenient)
+        )
 
     def is_achieved(self, state: MbagStateDict) -> int:
-        return int(state["current_blocks"] == self.target)
+        current = state["current_blocks"]
+        return int(
+            self.matches_blocks(current.blocks, current.block_states).all()
+        )
 
     def matches_blocks(
         self, current_blocks: np.ndarray, current_block_states: np.ndarray
@@ -83,21 +96,24 @@ class MinecraftStructureGoal(PossibleGoal):
         current_block_states = np.asarray(current_block_states)
         target_blocks = self.target.blocks
         target_block_states = self.target.block_states
-        matches_blocks = np.all(
-            current_blocks == target_blocks,
-            axis=tuple(range(-target_blocks.ndim, 0)),
+        trailing_axes = tuple(range(-target_blocks.ndim, 0))
+        cell_matches = (current_blocks == target_blocks) & (
+            current_block_states == target_block_states
         )
-        matches_states = np.all(
-            current_block_states == target_block_states,
-            axis=tuple(range(-target_block_states.ndim, 0)),
-        )
-        return matches_blocks & matches_states
+        if self.lenient:
+            needed = target_blocks != MinecraftBlocks.AIR
+            cell_matches = cell_matches | ~needed
+        return np.all(cell_matches, axis=trailing_axes)
 
     def __hash__(self) -> int:
         return self._hash
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, MinecraftStructureGoal) and self.target == other.target
+        return (
+            isinstance(other, MinecraftStructureGoal)
+            and self.lenient == other.lenient
+            and self.target == other.target
+        )
 
 
 class PossibleGoalSampler(ABC):
@@ -145,16 +161,32 @@ class RandomStructurePossibleGoalSampler(PossibleGoalSampler):
         goal_generator: GoalGenerator,
         size: WorldSize,
         weight: float = 1.0,
+        inf_blocks: Optional[bool] = None,
+        lenient: bool = False,
     ):
+        """
+        If inf_blocks is given, sampled structures are embedded into a full-size
+        world exactly as MbagEnv does for its true goal (floor, shift, buffer), so a
+        sampled goal can match the world state when the human builds it. Otherwise
+        the generator's raw output at ``size`` is used.
+        """
         self.goal_generator = goal_generator
         self.size = size
         self.weight = weight
+        self.inf_blocks = inf_blocks
+        self.lenient = lenient
 
     def sample(
         self, state: MbagStateDict, human_index: int
     ) -> Tuple[PossibleGoal, float]:
-        target = self.goal_generator.generate_goal(self.size)
-        return MinecraftStructureGoal(target), self.weight
+        if self.inf_blocks is None:
+            target = self.goal_generator.generate_goal(self.size)
+        else:
+            small_goal = self.goal_generator.generate_goal(
+                get_goal_size(self.size, self.inf_blocks)
+            )
+            target = embed_goal(small_goal, self.size, self.inf_blocks)
+        return MinecraftStructureGoal(target, lenient=self.lenient), self.weight
 
 
 class RandomStructurePossibleGoalGenerator(PossibleGoalGenerator):

@@ -29,6 +29,7 @@ import mbag
 from mbag.agents.heuristic_agents import ALL_HEURISTIC_AGENTS
 from mbag.environment.config import MbagConfigDict, MbagPlayerConfigDict, RewardSchedule
 from mbag.environment.goals.demonstrations import DemonstrationsGoalGeneratorConfig
+from mbag.environment.goals.fixed_pool import FixedPoolGoalGenerator
 from mbag.environment.goals.filters import DensityFilterConfig, MinSizeFilterConfig
 from mbag.environment.goals.goal_transform import (
     GoalTransformSpec,
@@ -125,6 +126,8 @@ def sacred_config(_log):  # noqa
     environment_name = "MBAGFlatActions-v1"
     goal_generator = "craftassist"
     goal_subset = "train"
+    goal_pool_size = 0  # If positive, the true goal is drawn from a fixed pool of this size.
+    goal_pool_seed = 0
     horizon = 1000
     randomize_first_episode_length = True
     truncate_on_no_progress_timesteps: Optional[int] = None
@@ -243,6 +246,19 @@ def sacred_config(_log):  # noqa
         "transforms": goal_transforms,
     }
 
+    # Optionally restrict the true goal (and, for the human-power objective, the
+    # possible goals) to a small fixed pool of goal_pool_size structures.
+    environment_goal_generator: Any = TransformedGoalGenerator
+    environment_goal_generator_config: Any = transformed_goal_generator_config
+    if goal_pool_size > 0:
+        environment_goal_generator = FixedPoolGoalGenerator
+        environment_goal_generator_config = {
+            "goal_generator": TransformedGoalGenerator,
+            "goal_generator_config": transformed_goal_generator_config,
+            "num_goals": goal_pool_size,
+            "pool_seed": goal_pool_seed,
+        }
+
     player_configs: List[MbagPlayerConfigDict] = []
     for player_index in range(num_players):
         player_config: MbagPlayerConfigDict = {
@@ -282,8 +298,8 @@ def sacred_config(_log):  # noqa
         "num_clutter_blocks": num_clutter_blocks,
         "clutter_bedrock_fraction": clutter_bedrock_fraction,
         "random_start_locations": random_start_locations,
-        "goal_generator": TransformedGoalGenerator,
-        "goal_generator_config": transformed_goal_generator_config,
+        "goal_generator": environment_goal_generator,
+        "goal_generator_config": environment_goal_generator_config,
         "malmo": {
             "use_malmo": False,
         },
@@ -371,6 +387,13 @@ def sacred_config(_log):  # noqa
     power_gamma_h = gamma
     power_zeta = 2.0
     power_beta_h = 10.0
+    power_progress_baseline = False
+    power_progress_kind = "progress"
+    power_goal_predicate = "exact"
+    power_x_epsilon = 0.0
+    power_value_from_ur = False
+    power_rollout_goal = False
+    power_num_goals = 1
     human_goal_ability_loss_coeff = 1.0
     aggregate_goal_ability_loss_coeff = 1.0
     use_other_agent_action_predictor = True
@@ -883,6 +906,13 @@ def sacred_config(_log):  # noqa
             power_gamma_h=power_gamma_h,
             power_zeta=power_zeta,
             power_beta_h=power_beta_h,
+            power_progress_baseline=power_progress_baseline,
+            power_progress_kind=power_progress_kind,
+            power_goal_predicate=power_goal_predicate,
+            power_x_epsilon=power_x_epsilon,
+            power_value_from_ur=power_value_from_ur,
+            power_rollout_goal=power_rollout_goal,
+            power_num_goals=power_num_goals,
             human_goal_ability_loss_coeff=human_goal_ability_loss_coeff,
             aggregate_goal_ability_loss_coeff=aggregate_goal_ability_loss_coeff,
             other_agent_action_predictor_loss_coeff=other_agent_action_predictor_loss_coeff,

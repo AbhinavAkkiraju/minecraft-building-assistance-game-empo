@@ -431,6 +431,7 @@ class MbagMCTSNode:
                     self.aggregate_goal_ability,
                     xi=self.mcts.power_xi,
                     eta=self.mcts.power_eta,
+                    epsilon_x=self.mcts.power_x_epsilon,
                 )
 
         self.child_priors[~self.valid_actions] = 0
@@ -670,6 +671,7 @@ class MbagMCTS(MCTS):
         self.use_power_reward = use_power_reward
         self.power_xi: float = mcts_param.get("power_xi", 1.0)
         self.power_eta: float = mcts_param.get("power_eta", 1.0)
+        self.power_x_epsilon: float = mcts_param.get("power_x_epsilon", 0.0)
         # Used to simulate the human during tree search when use_power_reward
         # is True: a fresh possible goal is sampled per compute_actions() call
         # and fed to power_human_policy_prior to get other_agent_action_dist,

@@ -237,8 +237,11 @@ class LowestBlockAgent(MbagAgent):
 
         action_type: MbagActionType = MbagAction.NOOP
 
-        # First, look at all blocks that need to be broken.
-        need_to_be_broken = current_blocks != goal_blocks
+        # First, look at all blocks that need to be broken. Bedrock can't be broken by
+        # a human, so skip it and keep building elsewhere instead of retrying forever.
+        need_to_be_broken = (current_blocks != goal_blocks) & (
+            current_blocks != MinecraftBlocks.BEDROCK
+        )
         can_be_broken = (
             need_to_be_broken & action_mask[MbagActionDistribution.BREAK_BLOCK]
         )

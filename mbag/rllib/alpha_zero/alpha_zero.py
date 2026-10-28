@@ -96,6 +96,31 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
         self.power_zeta = 2.0
         """Risk/reliability aversion exponent (zeta) in X_h = E_g[V_h^e^zeta]."""
         self.power_beta_h = 10.0
+        self.power_value_from_ur = False
+        """If True, V_r is trained on the discounted sum of the intrinsic reward
+        U_r (the model-based EXPECTED_REWARDS) instead of the environment reward. The
+        paper's robot has no extrinsic reward."""
+        self.power_rollout_goal = False
+        """If True, V_h^e/X_h targets use the goal the human is pursuing in the
+        rollout (the episode's goal), as in the paper's Phase 2, instead of an
+        independently sampled possible goal."""
+        self.power_num_goals = 1
+        """|G_h|: X_h targets are |G_h| * V_h^e ** zeta (paper eq. 14)."""
+        self.power_x_epsilon = 0.0
+        """Paper's epsilon_X (Appendix H.1): added to X_h before taking the -xi
+        power in U_r, which keeps U_r bounded when X_h is near 0."""
+        self.power_goal_predicate = "exact"
+        """When a possible goal counts as achieved: "exact" (the whole world matches
+        the goal structure) or "lenient" (every cell the structure needs holds the
+        right block; the rest of the world is ignored)."""
+        self.power_progress_baseline = False
+        self.power_progress_kind = "progress"
+        """Which baseline power_progress_baseline uses: "progress" (correct minus
+        wrong blocks) or "steps" (gamma_h ** steps still needed, 0 if bedrock blocks
+        a needed cell; meant for the lenient goal rule). See power.progress."""
+        """If True, X_h is predicted on top of a progress-toward-the-goal-pool
+        baseline (requires a fixed goal pool; see
+        mbag.rllib.alpha_zero.power.progress)."""
         """Inverse temperature of the heuristic human policy prior used to
         simulate the human during MCTS tree search (see
         HeuristicMbagHumanPolicyPrior)."""
@@ -140,6 +165,13 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
         power_gamma_h=NotProvided,
         power_zeta=NotProvided,
         power_beta_h=NotProvided,
+        power_value_from_ur=NotProvided,
+        power_rollout_goal=NotProvided,
+        power_num_goals=NotProvided,
+        power_x_epsilon=NotProvided,
+        power_goal_predicate=NotProvided,
+        power_progress_baseline=NotProvided,
+        power_progress_kind=NotProvided,
         human_goal_ability_loss_coeff=NotProvided,
         aggregate_goal_ability_loss_coeff=NotProvided,
         use_replay_buffer=NotProvided,
@@ -277,6 +309,24 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
             self.power_zeta = power_zeta
         if power_beta_h is not NotProvided:
             self.power_beta_h = power_beta_h
+        if power_value_from_ur is not NotProvided:
+            self.power_value_from_ur = power_value_from_ur
+        if power_rollout_goal is not NotProvided:
+            self.power_rollout_goal = power_rollout_goal
+        if power_num_goals is not NotProvided:
+            self.power_num_goals = power_num_goals
+        if power_x_epsilon is not NotProvided:
+            self.power_x_epsilon = power_x_epsilon
+        if power_goal_predicate is not NotProvided:
+            if power_goal_predicate not in ("exact", "lenient"):
+                raise ValueError("power_goal_predicate must be 'exact' or 'lenient'")
+            self.power_goal_predicate = power_goal_predicate
+        if power_progress_baseline is not NotProvided:
+            self.power_progress_baseline = power_progress_baseline
+        if power_progress_kind is not NotProvided:
+            if power_progress_kind not in ("progress", "steps"):
+                raise ValueError("power_progress_kind must be 'progress' or 'steps'")
+            self.power_progress_kind = power_progress_kind
         if human_goal_ability_loss_coeff is not NotProvided:
             self.human_goal_ability_loss_coeff = human_goal_ability_loss_coeff
         if aggregate_goal_ability_loss_coeff is not NotProvided:

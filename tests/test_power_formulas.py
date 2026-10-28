@@ -196,3 +196,16 @@ def test_robot_value_matches_manual_expectation():
     pi_r = [0.75, 0.25]
     v_r = robot_value(u_r, q_r_values, pi_r)
     assert v_r == pytest.approx(-0.5 + (0.75 * -1.0 + 0.25 * -2.0))
+
+
+def test_get_power_reward_epsilon_x_bounds_the_reward():
+    from mbag.rllib.alpha_zero.power.planning import get_power_reward
+
+    # Without epsilon the reward explodes as X_h -> 0; with it, it stays bounded.
+    assert get_power_reward(1e-6, xi=1.0, eta=1.1) < -1e6
+    bounded = get_power_reward(1e-6, xi=1.0, eta=1.1, epsilon_x=0.1)
+    assert -13 < bounded < -12
+    # Default epsilon of 0 keeps the previous behavior.
+    assert get_power_reward(0.5, xi=1.0, eta=1.0) == get_power_reward(
+        0.5, xi=1.0, eta=1.0, epsilon_x=0.0
+    )

@@ -2,6 +2,7 @@ import contextlib
 import copy
 from abc import ABC, abstractmethod
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     ContextManager,
@@ -49,6 +50,13 @@ from mbag.environment.types import (
     PLAYER_LOCATIONS,
     WorldSize,
 )
+
+if TYPE_CHECKING:
+    from .alpha_zero.power.progress import ProgressReference, StepsToGoalReference
+
+# Added to the progress baseline before it is used as the starting point of the
+# predicted X_h, so that X_h does not start at exactly 0 when there is no progress.
+PROGRESS_BASELINE_OFFSET = 0.05
 
 ACTION_MASK = "action_mask"
 PREV_OBS = "prev_obs"
@@ -250,6 +258,11 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
         self.use_prev_other_agent_action = extra_config["use_prev_other_agent_action"]
         self.goal_agnostic = extra_config["goal_agnostic"]
         self.use_power_heads = extra_config["use_power_heads"]
+        self.progress_reference: Optional[
+            Union["ProgressReference", "StepsToGoalReference"]
+        ] = None
+        self.progress_zeta = 2.0
+        self.progress_scale = 1.0
 
         self.action_mapping = torch.from_numpy(
             MbagActionDistribution.get_action_mapping(self.env_config)
@@ -851,8 +864,39 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
         """
         assert self.use_power_heads
         with self._amp_or_nothing:
-            x_h: torch.Tensor = self.aggregate_goal_ability_head(self._backbone_out)
+            if self.progress_reference is None:
+                x_h: torch.Tensor = self.aggregate_goal_ability_head(self._backbone_out)
+            else:
+                # Predict X_h on top of a progress baseline: the head's pre-activation
+                # is added to the inverse softplus of (baseline + offset), so the
+                # output starts at about baseline + offset and the network learns a
+                # correction in either direction (see power.progress).
+                raw = self.aggregate_goal_ability_head[:-1](self._backbone_out)
+                baseline = self._progress_baseline(raw.device)
+                target = (baseline + PROGRESS_BASELINE_OFFSET).to(raw.dtype)[:, None]
+                inverse_softplus = target + torch.log(-torch.expm1(-target))
+                x_h = nn.functional.softplus(raw + inverse_softplus)
         return x_h.float().squeeze(1)
+
+    def set_progress_reference(
+        self,
+        reference: Union["ProgressReference", "StepsToGoalReference"],
+        zeta: float,
+        scale: float = 1.0,
+    ):
+        """
+        Make aggregate_goal_ability() predict X_h on top of the mean over the
+        reference goals of progress ** zeta (see mbag.rllib.alpha_zero.power.progress).
+        """
+        self.progress_reference = reference
+        self.progress_zeta = zeta
+        self.progress_scale = scale
+
+    def _progress_baseline(self, device) -> torch.Tensor:
+        assert self.progress_reference is not None
+        current_blocks = self._world_obs[:, CURRENT_BLOCKS].to(device)
+        progress = self.progress_reference.progress(current_blocks)  # (B, N)
+        return self.progress_scale * (progress**self.progress_zeta).mean(dim=1)
 
     def get_initial_state(self):
         state: List[TensorType]

@@ -12,6 +12,7 @@ from ray.rllib.utils.typing import AgentID, PolicyID
 
 from mbag.agents.action_distributions import MbagActionDistribution
 from mbag.environment.actions import MBAG_ACTION_BREAK_PALETTE_NAME, MbagAction
+from mbag.environment.blocks import MinecraftBlocks
 from mbag.environment.types import MbagInfoDict
 from mbag.rllib.alpha_zero import EXPECTED_OWN_REWARDS, EXPECTED_REWARDS
 from mbag.rllib.rllib_env import unwrap_mbag_env
@@ -98,6 +99,68 @@ class MbagCallbacks(AlphaZeroDefaultCallbacks):
                 f"{policy_id}/num_{MBAG_ACTION_BREAK_PALETTE_NAME}", 0
             )
 
+    def _log_yielding_and_bedrock_metrics(
+        self,
+        worker: "RolloutWorker",
+        env,
+        episode: Union[Episode, EpisodeV2],
+    ) -> None:
+        """
+        Two-player diagnostics for "does the assistant step out of the human's way?":
+
+        - num_adjacent_to_human_steps: steps where the assistant is within one block
+          of the human (in every axis).
+        - num_yield_opportunities: steps where the assistant was adjacent to the
+          human on the previous step and the human has just acted.
+        - num_yields: of those, the steps where the assistant is no longer adjacent.
+
+        Also logs the number of bedrock blocks in the world (bedrock_initial and
+        bedrock_remaining), so we can see whether the assistant clears bedrock.
+        """
+        mbag_env = unwrap_mbag_env(env)
+
+        # Skip the bedrock floor (y=0); only clutter above it can be cleared.
+        bedrock_remaining = int(
+            np.sum(mbag_env.current_blocks.blocks[:, 1:] == MinecraftBlocks.BEDROCK)
+        )
+        episode.custom_metrics.setdefault("bedrock_initial", bedrock_remaining)
+        episode.custom_metrics["bedrock_remaining"] = bedrock_remaining
+
+        # Whether the true goal is built at the end of the episode (the last value
+        # logged wins): "exact" needs the whole world to match, "lenient" only the
+        # cells the goal structure needs.
+        goal = mbag_env.goal_blocks
+        current = mbag_env.current_blocks
+        cells_match = (current.blocks == goal.blocks) & (
+            current.block_states == goal.block_states
+        )
+        needed = goal.blocks != MinecraftBlocks.AIR
+        episode.custom_metrics["goal_built_exact"] = float(cells_match.all())
+        episode.custom_metrics["goal_built_lenient"] = float(
+            (cells_match | ~needed).all()
+        )
+
+        if len(mbag_env.player_locations) != 2:
+            return
+        assistant_policy_id = worker.policy_mapping_fn("player_1", episode, worker)
+        for name in ["adjacent_to_human_steps", "yield_opportunities", "yields"]:
+            episode.custom_metrics.setdefault(
+                f"{assistant_policy_id}/num_{name}", 0
+            )
+        human_loc, assistant_loc = mbag_env.player_locations
+        adjacent = all(abs(a - b) <= 1 for a, b in zip(human_loc, assistant_loc))
+        if adjacent:
+            episode.custom_metrics[
+                f"{assistant_policy_id}/num_adjacent_to_human_steps"
+            ] += 1
+        if episode.user_data.get("was_adjacent", False):
+            episode.custom_metrics[
+                f"{assistant_policy_id}/num_yield_opportunities"
+            ] += 1
+            if not adjacent:
+                episode.custom_metrics[f"{assistant_policy_id}/num_yields"] += 1
+        episode.user_data["was_adjacent"] = adjacent
+
     def on_episode_step(
         self,
         *,
@@ -113,6 +176,8 @@ class MbagCallbacks(AlphaZeroDefaultCallbacks):
         env = base_env.get_sub_environments()[env_index or 0]
         state = env.get_state()
         episode.user_data["state"] = state
+
+        self._log_yielding_and_bedrock_metrics(worker, env, episode)
 
         for player_index, agent_id in enumerate(episode.get_agents()):
             policy_id = worker.policy_mapping_fn(agent_id, episode, worker)

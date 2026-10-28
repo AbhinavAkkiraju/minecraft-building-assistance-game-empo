@@ -31,14 +31,18 @@ from torch import nn
 from mbag.environment.blocks import MinecraftBlocks
 from mbag.environment.config import MbagConfigDict
 from mbag.environment.goals import ALL_GOAL_GENERATORS
+from mbag.environment.goals.embedding import embed_goal, get_goal_size
+from mbag.environment.goals.fixed_pool import FixedPoolGoalGenerator
 from mbag.environment.goals.possible_goals import (
     MinecraftStructureGoal,
     RandomStructurePossibleGoalSampler,
 )
+from mbag.environment.mbag_env import MbagEnv
 from mbag.environment.state import MbagStateDict
 from mbag.environment.types import (
     CURRENT_BLOCK_STATES,
     CURRENT_BLOCKS,
+    GOAL_BLOCK_STATES,
     GOAL_BLOCKS,
     MbagInfoDict,
     WorldSize,
@@ -56,6 +60,7 @@ from .mcts import MbagMCTS, MbagMCTSNode, MbagRootParentNode
 from .planning import MbagEnvModel
 from .power.formulas import human_goal_ability_monte_carlo_targets
 from .power.human_policy_prior import HeuristicMbagHumanPolicyPrior
+from .power.progress import ProgressReference, StepsToGoalReference
 
 ENV_STATES = "env_states"
 PRIOR_POLICIES = "prior_policies"
@@ -114,6 +119,7 @@ class MbagAlphaZeroPolicy(
         mcts_config = dict(config["mcts_config"])
         mcts_config.setdefault("power_xi", config.get("power_xi", 1.0))
         mcts_config.setdefault("power_eta", config.get("power_eta", 1.0))
+        mcts_config.setdefault("power_x_epsilon", config.get("power_x_epsilon", 0.0))
         self.mcts = MbagMCTS(
             self.model,
             mcts_config,
@@ -216,9 +222,22 @@ class MbagAlphaZeroPolicy(
             # timestep), independently of the true goal, so that V_h^e(s_t, g_h)
             # forms a valid TD sequence across the fragment (see
             # postprocess_trajectory).
-            self.power_possible_goal_sampler = RandomStructurePossibleGoalSampler(
-                goal_generator, world_size
+            self.power_goal_lenient: bool = (
+                config.get("power_goal_predicate", "exact") == "lenient"
             )
+            self.power_possible_goal_sampler = RandomStructurePossibleGoalSampler(
+                goal_generator,
+                world_size,
+                inf_blocks=MbagEnv.get_config(env_config)["abilities"]["inf_blocks"],
+                lenient=self.power_goal_lenient,
+            )
+            self.power_value_from_ur: bool = config.get("power_value_from_ur", False)
+            self.power_rollout_goal: bool = config.get("power_rollout_goal", False)
+            self.power_num_goals: float = float(config.get("power_num_goals", 1))
+            if config.get("power_progress_baseline", False):
+                self._set_up_power_progress_baseline(
+                    goal_generator, world_size, env_config, config
+                )
             self.power_gamma_h: float = config.get("power_gamma_h", config["gamma"])
             self.power_zeta: float = config.get("power_zeta", 2.0)
             self.human_goal_ability_loss_coeff = config.get(
@@ -683,6 +702,49 @@ class MbagAlphaZeroPolicy(
 
         return np.array(actions), state_out, extra_out
 
+    def _set_up_power_progress_baseline(
+        self, goal_generator, world_size, env_config, config
+    ) -> None:
+        """
+        Predict X_h on top of the mean progress toward the pool of possible goals
+        (see mbag.rllib.alpha_zero.power.progress). Needs a fixed goal pool whose
+        structures fill the buildable area, so each pool goal has exactly one
+        placement in the world.
+        """
+        if not isinstance(goal_generator, FixedPoolGoalGenerator):
+            raise ValueError("power_progress_baseline requires goal_pool_size > 0")
+        inf_blocks = MbagEnv.get_config(env_config)["abilities"]["inf_blocks"]
+        goal_size = get_goal_size(world_size, inf_blocks)
+        usable_x = world_size[0] if inf_blocks else world_size[0] - 1
+        goals = []
+        for small_goal in goal_generator.get_pool(goal_size):
+            if usable_x - small_goal.size[0] - 1 > 1:
+                raise ValueError(
+                    "power_progress_baseline needs pool goals that fill the build "
+                    "area (their placement must not be random)"
+                )
+            goals.append(embed_goal(small_goal, world_size, inf_blocks).blocks)
+        goals_tensor = torch.from_numpy(np.stack(goals).astype(np.int64))
+        reference: Union[ProgressReference, StepsToGoalReference]
+        if config.get("power_progress_kind", "progress") == "steps":
+            reference = StepsToGoalReference(
+                goals_tensor, config.get("power_gamma_h", config["gamma"])
+            )
+        else:
+            initial_world = np.zeros(world_size, dtype=np.int64)
+            initial_world[:, 0, :] = MinecraftBlocks.BEDROCK
+            initial_world[:, 1, :] = MinecraftBlocks.NAME2ID["dirt"]
+            reference = ProgressReference(
+                goals_tensor, torch.from_numpy(initial_world)
+            )
+        models = getattr(self, "model_gpu_towers", None) or [self.model]
+        for model in models:
+            model.set_progress_reference(
+                reference,
+                config.get("power_zeta", 2.0),
+                scale=float(config.get("power_num_goals", 1)),
+            )
+
     def _add_power_training_columns(
         self,
         sample_batch: SampleBatch,
@@ -696,17 +758,12 @@ class MbagAlphaZeroPolicy(
         how VALUE_TARGETS above bootstraps V_r with the model's own value
         prediction at the truncation boundary.
 
-        If the fragment ends in true termination (not just truncation),
-        there is no observed successor state past the last transition to
-        check goal achievement against, so -- exactly like VALUE_TARGETS'
-        last_r=0 convention -- that one boundary transition's achievement and
-        bootstrap value are both treated as 0. This is a documented
-        approximation affecting at most one timestep per completed episode.
+        If the fragment ends in true termination (not just truncation), the
+        last transition's achievement is read from the final observation
+        (NEXT_OBS), and -- exactly like VALUE_TARGETS' last_r=0 convention -- the
+        bootstrap value past it is 0.
         """
         assert self.model is not None
-        possible_goal, _ = self.power_possible_goal_sampler.sample(None, 0)
-        assert isinstance(possible_goal, MinecraftStructureGoal)
-        target_blocks = possible_goal.target.blocks
 
         # sample_batch[SampleBatch.OBS] may already be a torch tensor by this
         # point depending on the connector pipeline in use, even though
@@ -715,6 +772,28 @@ class MbagAlphaZeroPolicy(
         world_obs, _, _ = restore_original_dimensions(
             convert_to_numpy(sample_batch[SampleBatch.OBS]), self.obs_space, "numpy"
         )
+
+        if self.power_rollout_goal:
+            # As in the paper's Phase 2, the goal g_h is the one the human is pursuing
+            # in this rollout (the episode's goal, which the observation carries even
+            # though the model masks it), so V_h^e(s, g_h) is estimated for a goal the
+            # human is actually working toward. The robot's networks never see it.
+            goal_blocks = world_obs[0, GOAL_BLOCKS]
+            if not np.any(goal_blocks):
+                raise ValueError(
+                    "power_rollout_goal needs the goal in the observation "
+                    "(goal_visibility must be True)"
+                )
+            true_goal = MinecraftBlocks(goal_blocks.shape)
+            true_goal.blocks[:] = goal_blocks
+            true_goal.block_states[:] = world_obs[0, GOAL_BLOCK_STATES]
+            possible_goal = MinecraftStructureGoal(
+                true_goal, lenient=self.power_goal_lenient
+            )
+        else:
+            possible_goal, _ = self.power_possible_goal_sampler.sample(None, 0)
+        assert isinstance(possible_goal, MinecraftStructureGoal)
+        target_blocks = possible_goal.target.blocks
         # achieved[t] for t = 0..T-2 is whether g_h is achieved in the state
         # reached after timestep t's action, i.e. OBS[t + 1].
         achieved = possible_goal.matches_blocks(
@@ -724,7 +803,23 @@ class MbagAlphaZeroPolicy(
         last_achieved: float
         last_human_goal_ability: float
         if terminated:
+            # The last transition's successor state is the observation RLlib stores
+            # as NEXT_OBS (the final observation returned with done=True), so we can
+            # check whether g_h was achieved by the final action, e.g. the human
+            # completing its house. Past that state there is nothing to bootstrap.
             last_achieved = 0.0
+            if SampleBatch.NEXT_OBS in sample_batch:
+                final_world_obs, _, _ = restore_original_dimensions(
+                    convert_to_numpy(sample_batch[SampleBatch.NEXT_OBS][-1:]),
+                    self.obs_space,
+                    "numpy",
+                )
+                last_achieved = float(
+                    possible_goal.matches_blocks(
+                        final_world_obs[0, CURRENT_BLOCKS],
+                        final_world_obs[0, CURRENT_BLOCK_STATES],
+                    )
+                )
             last_human_goal_ability = 0.0
         else:
             assert last_input_dict is not None
@@ -752,7 +847,10 @@ class MbagAlphaZeroPolicy(
             gamma_h=self.power_gamma_h,
             bootstrap_v_h_e=last_human_goal_ability,
         ).astype(np.float32)
-        x_h_targets = (v_h_e_targets**self.power_zeta).astype(np.float32)
+        # Paper eq. (14): x_h(s) = |G_h| * V_h^e(s, g_h) ** zeta.
+        x_h_targets = (self.power_num_goals * v_h_e_targets**self.power_zeta).astype(
+            np.float32
+        )
 
         sample_batch[POSSIBLE_GOAL_BLOCKS] = np.repeat(
             target_blocks[None], len(sample_batch), axis=0
@@ -782,9 +880,12 @@ class MbagAlphaZeroPolicy(
                 assert self.model is not None
                 self._run_model_on_input_dict(input_dict)
                 last_r = self.model.value_function()[0].item()
-            rewards_plus_v = np.concatenate(
-                [sample_batch[SampleBatch.REWARDS], np.array([last_r])]
-            )
+            rewards = sample_batch[SampleBatch.REWARDS]
+            if self.use_power_reward and self.power_value_from_ur:
+                # The robot has no extrinsic reward: V_r is the discounted sum of the
+                # intrinsic reward U_r the search used, not the environment reward.
+                rewards = np.asarray(sample_batch[EXPECTED_REWARDS], dtype=np.float32)
+            rewards_plus_v = np.concatenate([rewards, np.array([last_r])])
             discounted_returns = discount_cumsum(rewards_plus_v, self.config["gamma"])[
                 :-1
             ].astype(np.float32)
@@ -963,6 +1064,16 @@ class MbagAlphaZeroPolicy(
         aggregate_goal_ability_loss: torch.Tensor = torch.tensor(
             0.0, device=policy_loss.device
         )
+        x_h_stats = {
+            name: torch.tensor(0.0, device=policy_loss.device)
+            for name in [
+                "x_h_pred_min",
+                "x_h_pred_mean",
+                "x_h_target_mean",
+                "x_h_target_max",
+                "u_r_min",
+            ]
+        }
         if POSSIBLE_GOAL_BLOCKS in train_batch:
             predicted_v_h_e = model.human_goal_ability(
                 cast(torch.Tensor, train_batch[POSSIBLE_GOAL_BLOCKS])
@@ -975,6 +1086,23 @@ class MbagAlphaZeroPolicy(
             aggregate_goal_ability_loss = reduce_mean_model(
                 (predicted_x_h - train_batch[AGGREGATE_GOAL_ABILITY_TARGETS]) ** 2
             )
+
+            # Diagnostics only: how small X_h gets, since U_r = -(X_h^-xi)^eta
+            # blows up as X_h -> 0.
+            x_h_targets = cast(torch.Tensor, train_batch[AGGREGATE_GOAL_ABILITY_TARGETS])
+            x_h_stats = {
+                "x_h_pred_min": predicted_x_h.min().detach(),
+                "x_h_pred_mean": predicted_x_h.mean().detach(),
+                "x_h_target_mean": x_h_targets.mean().detach(),
+                "x_h_target_max": x_h_targets.max().detach(),
+                "u_r_min": (
+                    -(
+                        (predicted_x_h.min().detach() + self.mcts.power_x_epsilon)
+                        ** (-self.mcts.power_xi)
+                    )
+                    ** self.mcts.power_eta
+                ),
+            }
 
         # Compute total loss.
         total_loss: torch.Tensor = (
@@ -1058,6 +1186,8 @@ class MbagAlphaZeroPolicy(
         model.tower_stats["aggregate_goal_ability_loss"] = (
             aggregate_goal_ability_loss.detach()
         )
+        for name, value in x_h_stats.items():
+            model.tower_stats[name] = value
 
         return total_loss
 
@@ -1083,6 +1213,11 @@ class MbagAlphaZeroPolicy(
             "entropy",
             "human_goal_ability_loss",
             "aggregate_goal_ability_loss",
+            "x_h_pred_min",
+            "x_h_pred_mean",
+            "x_h_target_mean",
+            "x_h_target_max",
+            "u_r_min",
             "other_agent_action_predictor_loss",
             "anchor_policy_kl",
         ]:

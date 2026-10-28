@@ -74,6 +74,9 @@ class _FakePowerPolicy:
         self.obs_space = obs_space
         self.power_gamma_h = gamma_h
         self.power_zeta = zeta
+        self.power_rollout_goal = False
+        self.power_goal_lenient = False
+        self.power_num_goals = 1.0
         self.power_possible_goal_sampler = RandomStructurePossibleGoalSampler(
             BasicGoalGenerator({}), WORLD_SIZE
         )
