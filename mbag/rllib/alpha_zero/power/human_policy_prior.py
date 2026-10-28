@@ -41,6 +41,13 @@ class HumanPolicyPrior(ABC):
         """
 
 
+# Per-layer bonus to a helpful action's advantage when the prior respects human
+# abilities, so lower layers are built first (with beta_h = 10, each layer down is
+# about e^6 times more likely). Without it the one-step heuristic often buries cells
+# that still need work and can never finish a goal.
+LAYER_PREFERENCE = 0.6
+
+
 class HeuristicMbagHumanPolicyPrior(HumanPolicyPrior):
     """
     Cheap, untrained human policy prior for a hypothetical possible goal.
@@ -65,9 +72,26 @@ class HeuristicMbagHumanPolicyPrior(HumanPolicyPrior):
     matter in practice.
     """
 
-    def __init__(self, env_config: MbagConfigDict, beta_h: float = 10.0):
+    def __init__(
+        self,
+        env_config: MbagConfigDict,
+        beta_h: float = 10.0,
+        human_cannot_break_bedrock: bool = False,
+        lenient: bool = False,
+    ):
+        """
+        Args:
+            human_cannot_break_bedrock: Don't consider breaking bedrock (MBAG's
+                human players can't), so the modeled human doesn't waste
+                actions on it.
+            lenient: Match the lenient goal rule: only cells the goal needs
+                (non-air target cells) matter, so there is no advantage in
+                clearing cells the goal leaves empty.
+        """
         super().__init__(env_config)
         self.beta_h = beta_h
+        self.human_cannot_break_bedrock = human_cannot_break_bedrock
+        self.lenient = lenient
 
     def action_distribution(
         self, obs: MbagObs, possible_goal: PossibleGoal
@@ -105,10 +129,44 @@ class HeuristicMbagHumanPolicyPrior(HumanPolicyPrior):
         # mismatch), 0 if the target wants a different non-air block (a
         # necessary but not immediately rewarded intermediate step).
         breakable_cells = ~is_air & ~currently_matches
+        if self.human_cannot_break_bedrock:
+            breakable_cells &= current_block_ids != MinecraftBlocks.BEDROCK
         valid[MbagActionDistribution.BREAK_BLOCK][breakable_cells] = True
-        advantage[MbagActionDistribution.BREAK_BLOCK][
-            breakable_cells & (target_block_ids == MinecraftBlocks.AIR)
-        ] = 1.0
+        if not self.lenient:
+            advantage[MbagActionDistribution.BREAK_BLOCK][
+                breakable_cells & (target_block_ids == MinecraftBlocks.AIR)
+            ] = 1.0
+
+        if self.lenient:
+            # Breaking a wrong block in a cell the goal needs is a necessary step
+            # toward the goal, so count it as progress too.
+            advantage[MbagActionDistribution.BREAK_BLOCK][
+                breakable_cells & (target_block_ids != MinecraftBlocks.AIR)
+            ] = 1.0
+
+        if self.human_cannot_break_bedrock or self.lenient:
+            # Build bottom-up, as a sensible human would: prefer lower layers, so a
+            # cell that still needs replacing isn't buried under new blocks (after
+            # which it can't be reached any more).
+            # A bonus for lower layers (rather than a penalty for higher ones) keeps
+            # every helpful action better than doing nothing.
+            layers_from_top = (height - 1 - np.arange(height, dtype=float))[
+                None, None, :, None
+            ]
+            advantage = np.where(
+                advantage > 0, advantage + LAYER_PREFERENCE * layers_from_top, advantage
+            )
+
+            # Respect the human's abilities: only consider actions the environment
+            # actually allows (e.g. placing next to an existing block), so the
+            # modeled human doesn't waste steps on moves that do nothing.
+            world_obs, inventory_obs, timestep = obs
+            action_mask = MbagActionDistribution.get_mask(
+                self.env_config,
+                (world_obs[None], inventory_obs[None], np.asarray(timestep)[None]),
+            )[0]
+            valid &= action_mask
+            valid[0, 0, 0, 0] = True
 
         logits = np.where(valid, self.beta_h * advantage, -np.inf)
         logits -= np.max(logits)

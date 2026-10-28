@@ -17,6 +17,7 @@ from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.policy.torch_mixins import EntropyCoeffSchedule, LearningRateSchedule
 from ray.rllib.policy.torch_policy import TorchPolicy
 from ray.rllib.policy.view_requirement import ViewRequirement
+from ray.rllib.utils import force_list
 from ray.rllib.utils.numpy import convert_to_numpy
 from ray.rllib.utils.schedules import ConstantSchedule, PiecewiseSchedule, Schedule
 from ray.rllib.utils.torch_utils import (
@@ -61,6 +62,7 @@ from .planning import MbagEnvModel
 from .power.formulas import human_goal_ability_monte_carlo_targets
 from .power.human_policy_prior import HeuristicMbagHumanPolicyPrior
 from .power.progress import ProgressReference, StepsToGoalReference
+from .power.simulated_targets import SimulatedGoalAbility
 
 ENV_STATES = "env_states"
 PRIOR_POLICIES = "prior_policies"
@@ -75,6 +77,10 @@ PREV_GOAL_KL_COEFF = "prev_goal_kl_coeff"
 POSSIBLE_GOAL_BLOCKS = "possible_goal_blocks"
 HUMAN_GOAL_ABILITY_TARGETS = "human_goal_ability_targets"
 AGGREGATE_GOAL_ABILITY_TARGETS = "aggregate_goal_ability_targets"
+# 1 where AGGREGATE_GOAL_ABILITY_TARGETS should be used in the X_h loss.
+AGGREGATE_GOAL_ABILITY_MASK = "aggregate_goal_ability_mask"
+# Simulated V_h^e(s, g) for every goal in the pool (see power_x_from_v).
+SIMULATED_GOAL_ABILITIES = "simulated_goal_abilities"
 FORCE_NOOP = "force_noop"
 C_PUCT = "c_puct"
 PREV_C_PUCT = "prev_c_puct"
@@ -231,6 +237,25 @@ class MbagAlphaZeroPolicy(
                 inf_blocks=MbagEnv.get_config(env_config)["abilities"]["inf_blocks"],
                 lenient=self.power_goal_lenient,
             )
+            if config.get("power_separate_network", False):
+                # The paper uses separate networks for the robot's values and the
+                # human's quantities (App. F.1). A full copy of the model (its own
+                # embedding, backbone and heads) is used only for V_h^e and X_h, so
+                # the robot's value loss can't reshape the features they rely on.
+                if config.get("power_progress_baseline", False):
+                    raise ValueError(
+                        "power_separate_network is not supported together with "
+                        "power_progress_baseline"
+                    )
+                if self.model.get_initial_state():
+                    raise ValueError(
+                        "power_separate_network requires a non-recurrent model"
+                    )
+                power_model = copy.deepcopy(self.model)
+                self.model.power_model = power_model
+                # Rebuild the optimizer so the power network has its own parameter
+                # group (and therefore its own gradient clipping).
+                self._optimizers = force_list(self.optimizer())
             self.power_value_from_ur: bool = config.get("power_value_from_ur", False)
             self.power_rollout_goal: bool = config.get("power_rollout_goal", False)
             self.power_num_goals: float = float(config.get("power_num_goals", 1))
@@ -246,9 +271,50 @@ class MbagAlphaZeroPolicy(
             self.aggregate_goal_ability_loss_coeff = config.get(
                 "aggregate_goal_ability_loss_coeff", 1.0
             )
+            prior_respects_abilities = config.get("power_prior_respects_abilities", False)
             self.power_human_policy_prior = HeuristicMbagHumanPolicyPrior(
-                config["env_config"], beta_h=config.get("power_beta_h", 10.0)
+                config["env_config"],
+                beta_h=config.get("power_beta_h", 10.0),
+                human_cannot_break_bedrock=prior_respects_abilities
+                and bool(MbagEnv.get_config(env_config)["players"][0]["is_human"]),
+                lenient=prior_respects_abilities and self.power_goal_lenient,
             )
+            self.power_simulated_x_targets: int = int(
+                config.get("power_simulated_x_targets", 0)
+            )
+            self.power_goal_simulator: Optional[SimulatedGoalAbility] = None
+            self.power_x_from_v: bool = bool(config.get("power_x_from_v", False))
+            if self.power_x_from_v and self.power_simulated_x_targets <= 0:
+                raise ValueError("power_x_from_v requires power_simulated_x_targets > 0")
+            if self.power_simulated_x_targets > 0:
+                pool_goals = self._pool_goals(goal_generator, world_size, env_config)
+                if self.power_x_from_v:
+                    # X_h(s) = sum_g V_h^e(s, g) ** zeta over the pool (paper eq. 7),
+                    # computed from the goal-conditioned V_h^e head everywhere
+                    # (search, loss and logging) instead of the aggregate head.
+                    goal_set = torch.from_numpy(
+                        np.stack([goal.blocks for goal in pool_goals]).astype(np.int64)
+                    )
+                    models = getattr(self, "model_gpu_towers", None) or [self.model]
+                    for model in models:
+                        power_net = getattr(model, "power_model", None) or model
+                        power_net.set_goal_set(goal_set, self.power_zeta)
+                    self.view_requirements[SIMULATED_GOAL_ABILITIES] = ViewRequirement(
+                        space=spaces.Box(low=0, high=1, shape=(len(pool_goals),)),
+                        used_for_compute_actions=False,
+                    )
+                self.power_goal_simulator = SimulatedGoalAbility(
+                    env_config,
+                    [
+                        MinecraftStructureGoal(goal, lenient=self.power_goal_lenient)
+                        for goal in pool_goals
+                    ],
+                    self.power_human_policy_prior,
+                    gamma_h=self.power_gamma_h,
+                    zeta=self.power_zeta,
+                    horizon=int(config.get("power_simulation_horizon", 80)),
+                    seed=int(config.get("seed") or 0),
+                )
             # MbagMCTS was constructed above (before world_size/env_config were
             # available here); attach the human policy prior and possible-goal
             # sampler it needs to simulate the human during tree search.
@@ -271,6 +337,10 @@ class MbagAlphaZeroPolicy(
             )
             self.view_requirements[AGGREGATE_GOAL_ABILITY_TARGETS] = ViewRequirement(
                 space=spaces.Box(low=0, high=np.inf, shape=()),
+                used_for_compute_actions=False,
+            )
+            self.view_requirements[AGGREGATE_GOAL_ABILITY_MASK] = ViewRequirement(
+                space=spaces.Box(low=0, high=1, shape=()),
                 used_for_compute_actions=False,
             )
 
@@ -702,6 +772,28 @@ class MbagAlphaZeroPolicy(
 
         return np.array(actions), state_out, extra_out
 
+    @staticmethod
+    def _pool_goals(goal_generator, world_size, env_config) -> List[MinecraftBlocks]:
+        """
+        The fixed goal pool, each goal embedded in the world exactly as MbagEnv
+        places it. Needs pool goals that fill the build area, so each has exactly
+        one placement.
+        """
+        if not isinstance(goal_generator, FixedPoolGoalGenerator):
+            raise ValueError("this power setting requires goal_pool_size > 0")
+        inf_blocks = MbagEnv.get_config(env_config)["abilities"]["inf_blocks"]
+        goal_size = get_goal_size(world_size, inf_blocks)
+        usable_x = world_size[0] if inf_blocks else world_size[0] - 1
+        goals = []
+        for small_goal in goal_generator.get_pool(goal_size):
+            if usable_x - small_goal.size[0] - 1 > 1:
+                raise ValueError(
+                    "pool goals must fill the build area (their placement must not "
+                    "be random)"
+                )
+            goals.append(embed_goal(small_goal, world_size, inf_blocks))
+        return goals
+
     def _set_up_power_progress_baseline(
         self, goal_generator, world_size, env_config, config
     ) -> None:
@@ -711,19 +803,10 @@ class MbagAlphaZeroPolicy(
         structures fill the buildable area, so each pool goal has exactly one
         placement in the world.
         """
-        if not isinstance(goal_generator, FixedPoolGoalGenerator):
-            raise ValueError("power_progress_baseline requires goal_pool_size > 0")
-        inf_blocks = MbagEnv.get_config(env_config)["abilities"]["inf_blocks"]
-        goal_size = get_goal_size(world_size, inf_blocks)
-        usable_x = world_size[0] if inf_blocks else world_size[0] - 1
-        goals = []
-        for small_goal in goal_generator.get_pool(goal_size):
-            if usable_x - small_goal.size[0] - 1 > 1:
-                raise ValueError(
-                    "power_progress_baseline needs pool goals that fill the build "
-                    "area (their placement must not be random)"
-                )
-            goals.append(embed_goal(small_goal, world_size, inf_blocks).blocks)
+        goals = [
+            goal.blocks
+            for goal in self._pool_goals(goal_generator, world_size, env_config)
+        ]
         goals_tensor = torch.from_numpy(np.stack(goals).astype(np.int64))
         reference: Union[ProgressReference, StepsToGoalReference]
         if config.get("power_progress_kind", "progress") == "steps":
@@ -837,8 +920,13 @@ class MbagAlphaZeroPolicy(
             target_blocks_tensor = torch.from_numpy(target_blocks[None]).to(
                 self.model.device
             )
+            power_net = getattr(self.model, "power_model", None)
+            if power_net is not None:
+                power_net(self._lazy_tensor_dict(last_input_dict), [], None)
+            else:
+                power_net = self.model
             last_human_goal_ability = float(
-                self.model.human_goal_ability(target_blocks_tensor)[0].item()
+                power_net.human_goal_ability(target_blocks_tensor)[0].item()
             )
 
         achieved = np.concatenate([achieved, [last_achieved]])
@@ -852,6 +940,42 @@ class MbagAlphaZeroPolicy(
             np.float32
         )
 
+        x_h_mask = np.ones(len(x_h_targets), dtype=np.float32)
+        if getattr(self, "power_goal_simulator", None) is not None:
+            # Model-based X_h targets (paper Section 3.1): simulate the human prior
+            # pursuing each possible goal from a few states of this fragment, and
+            # train X_h only on those states.
+            x_h_mask[:] = 0
+            simulated_abilities: Optional[np.ndarray] = None
+            if self.power_x_from_v:
+                simulated_abilities = np.zeros(
+                    (len(x_h_targets), len(self.power_goal_simulator.goals)),
+                    dtype=np.float32,
+                )
+            num_states = min(self.power_simulated_x_targets, len(x_h_targets))
+            offset = np.random.randint(
+                max(1, len(x_h_targets) // max(1, num_states))
+            )
+            indices = np.unique(
+                (np.linspace(0, len(x_h_targets) - 1, num_states) + offset)
+                .astype(int)
+                .clip(0, len(x_h_targets) - 1)
+            )
+            for t in indices:
+                current = MinecraftBlocks(world_obs[t, CURRENT_BLOCKS].shape)
+                current.blocks[:] = world_obs[t, CURRENT_BLOCKS]
+                current.block_states[:] = world_obs[t, CURRENT_BLOCK_STATES]
+                abilities = self.power_goal_simulator.goal_abilities(current)
+                x_h_targets[t] = float(
+                    (abilities**self.power_goal_simulator.zeta).sum()
+                )
+                if simulated_abilities is not None:
+                    simulated_abilities[t] = abilities
+                x_h_mask[t] = 1
+            if simulated_abilities is not None:
+                sample_batch[SIMULATED_GOAL_ABILITIES] = simulated_abilities
+
+        sample_batch[AGGREGATE_GOAL_ABILITY_MASK] = x_h_mask
         sample_batch[POSSIBLE_GOAL_BLOCKS] = np.repeat(
             target_blocks[None], len(sample_batch), axis=0
         )
@@ -1075,17 +1199,61 @@ class MbagAlphaZeroPolicy(
             ]
         }
         if POSSIBLE_GOAL_BLOCKS in train_batch:
-            predicted_v_h_e = model.human_goal_ability(
+            power_net = getattr(model, "power_model", None)
+            if power_net is not None:
+                power_net(train_batch)  # Its own forward pass, with gradients.
+            else:
+                power_net = model
+            predicted_v_h_e = power_net.human_goal_ability(
                 cast(torch.Tensor, train_batch[POSSIBLE_GOAL_BLOCKS])
             )
             human_goal_ability_loss = reduce_mean_model(
                 (predicted_v_h_e - train_batch[HUMAN_GOAL_ABILITY_TARGETS]) ** 2
             )
 
-            predicted_x_h = model.aggregate_goal_ability()
-            aggregate_goal_ability_loss = reduce_mean_model(
-                (predicted_x_h - train_batch[AGGREGATE_GOAL_ABILITY_TARGETS]) ** 2
-            )
+            if SIMULATED_GOAL_ABILITIES in train_batch:
+                # power_x_from_v: train V_h^e on the simulated values for every pool
+                # goal at the simulated states; X_h is then computed from V_h^e
+                # (paper eq. 7), so there is no separate aggregate head to train.
+                sim_mask = cast(torch.Tensor, train_batch[AGGREGATE_GOAL_ABILITY_MASK])
+                sim_targets = cast(torch.Tensor, train_batch[SIMULATED_GOAL_ABILITIES])
+                if self.config.get("power_v_loss", "mse") == "bce":
+                    # V_h^e is a probability: cross-entropy on the logits keeps a
+                    # useful gradient even when predictions are near 0 or 1, unlike
+                    # squared error through a sigmoid.
+                    sim_error = F.binary_cross_entropy_with_logits(
+                        power_net.goal_set_abilities(logits=True),
+                        sim_targets,
+                        reduction="none",
+                    ).mean(dim=1)
+                else:
+                    sim_error = (
+                        (power_net.goal_set_abilities() - sim_targets) ** 2
+                    ).mean(dim=1)
+                human_goal_ability_loss = reduce_mean_model(
+                    sim_mask * sim_error
+                ) / reduce_mean_model(sim_mask).clamp(min=1e-8)
+
+            predicted_x_h = power_net.aggregate_goal_ability()
+            x_h_squared_error = (
+                predicted_x_h - train_batch[AGGREGATE_GOAL_ABILITY_TARGETS]
+            ) ** 2
+            if SIMULATED_GOAL_ABILITIES in train_batch:
+                # X_h is derived from V_h^e, which is trained above; keep the X_h
+                # error for logging only.
+                x_h_mask = cast(torch.Tensor, train_batch[AGGREGATE_GOAL_ABILITY_MASK])
+                aggregate_goal_ability_loss = (
+                    reduce_mean_model(x_h_mask * x_h_squared_error)
+                    / reduce_mean_model(x_h_mask).clamp(min=1e-8)
+                ).detach()
+            elif AGGREGATE_GOAL_ABILITY_MASK in train_batch:
+                # Only states with an X_h target count (see power_simulated_x_targets).
+                x_h_mask = cast(torch.Tensor, train_batch[AGGREGATE_GOAL_ABILITY_MASK])
+                aggregate_goal_ability_loss = reduce_mean_model(
+                    x_h_mask * x_h_squared_error
+                ) / reduce_mean_model(x_h_mask).clamp(min=1e-8)
+            else:
+                aggregate_goal_ability_loss = reduce_mean_model(x_h_squared_error)
 
             # Diagnostics only: how small X_h gets, since U_r = -(X_h^-xi)^eta
             # blows up as X_h -> 0.
@@ -1191,6 +1359,34 @@ class MbagAlphaZeroPolicy(
 
         return total_loss
 
+    def optimizer(self):
+        optimizers = super().optimizer()
+        power_model = getattr(getattr(self, "model", None), "power_model", None)
+        if power_model is None:
+            return optimizers
+        optimizers = force_list(optimizers)
+        main_optimizer = optimizers[0]
+        power_ids = {id(param) for param in power_model.parameters()}
+        main_params = [
+            param for param in self.model.parameters() if id(param) not in power_ids
+        ]
+        # Separate parameter groups are clipped separately (apply_grad_clipping), so
+        # large value-loss gradients can't shrink the power network's updates.
+        power_lr = main_optimizer.defaults["lr"] * self._power_lr_scale()
+        split_optimizer = type(main_optimizer)(
+            [
+                {"params": main_params},
+                {"params": list(power_model.parameters()), "lr": power_lr},
+            ],
+            **main_optimizer.defaults,
+        )
+        logger.info(f"separate power network: learning rate {power_lr}")
+        return [split_optimizer] + optimizers[1:]
+
+    def _power_lr_scale(self) -> float:
+        config = getattr(self, "config", None) or {}
+        return float(config.get("power_lr_scale", 1.0))
+
     def extra_grad_process(self, optimizer, loss):
         return apply_grad_clipping(self, optimizer, loss)
 
@@ -1231,6 +1427,15 @@ class MbagAlphaZeroPolicy(
 
     def on_global_var_update(self, global_vars):
         super().on_global_var_update(global_vars)
+
+        if getattr(self.model, "power_model", None) is not None:
+            # A learning rate schedule resets every parameter group to cur_lr;
+            # keep the power network's group at its scaled rate.
+            for optimizer in self._optimizers:
+                if len(optimizer.param_groups) > 1:
+                    optimizer.param_groups[1]["lr"] = (
+                        self.cur_lr * self._power_lr_scale()
+                    )
 
         if self._training:
             self.global_timestep_for_envs = global_vars["timestep"]

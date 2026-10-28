@@ -113,6 +113,28 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
         """When a possible goal counts as achieved: "exact" (the whole world matches
         the goal structure) or "lenient" (every cell the structure needs holds the
         right block; the rest of the world is ignored)."""
+        self.power_simulated_x_targets = 0
+        """If > 0, train X_h on model-based targets: simulate the human prior
+        pursuing each pool goal from this many states per trajectory fragment
+        (paper Section 3.1). Requires a goal pool."""
+        self.power_simulation_horizon = 80
+        """Steps per simulated human rollout for power_simulated_x_targets."""
+        self.power_prior_respects_abilities = False
+        self.power_x_from_v = False
+        self.power_separate_network = False
+        self.power_lr_scale = 1.0
+        self.power_v_loss = "mse"
+        """Loss for the simulated V_h^e targets (power_x_from_v): "mse" or "bce"
+        (cross-entropy on the logits)."""
+        """Learning rate of the separate power network, as a multiple of lr
+        (only with power_separate_network)."""
+        """Use a separate copy of the model (own embedding, backbone, heads and
+        gradient clipping) for V_h^e and X_h, as the paper uses separate networks."""
+        """Compute X_h from the V_h^e head over the goal pool (paper eq. 7), with
+        V_h^e trained on simulated values for every pool goal. Requires
+        power_simulated_x_targets > 0."""
+        """Make the human prior skip actions the human can't take (breaking
+        bedrock) and, with the lenient goal rule, cells the goal doesn't need."""
         self.power_progress_baseline = False
         self.power_progress_kind = "progress"
         """Which baseline power_progress_baseline uses: "progress" (correct minus
@@ -170,6 +192,13 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
         power_num_goals=NotProvided,
         power_x_epsilon=NotProvided,
         power_goal_predicate=NotProvided,
+        power_simulated_x_targets=NotProvided,
+        power_simulation_horizon=NotProvided,
+        power_prior_respects_abilities=NotProvided,
+        power_x_from_v=NotProvided,
+        power_separate_network=NotProvided,
+        power_lr_scale=NotProvided,
+        power_v_loss=NotProvided,
         power_progress_baseline=NotProvided,
         power_progress_kind=NotProvided,
         human_goal_ability_loss_coeff=NotProvided,
@@ -321,6 +350,22 @@ class MbagAlphaZeroConfig(AlphaZeroConfig):
             if power_goal_predicate not in ("exact", "lenient"):
                 raise ValueError("power_goal_predicate must be 'exact' or 'lenient'")
             self.power_goal_predicate = power_goal_predicate
+        if power_simulated_x_targets is not NotProvided:
+            self.power_simulated_x_targets = power_simulated_x_targets
+        if power_simulation_horizon is not NotProvided:
+            self.power_simulation_horizon = power_simulation_horizon
+        if power_prior_respects_abilities is not NotProvided:
+            self.power_prior_respects_abilities = power_prior_respects_abilities
+        if power_x_from_v is not NotProvided:
+            self.power_x_from_v = power_x_from_v
+        if power_separate_network is not NotProvided:
+            self.power_separate_network = power_separate_network
+        if power_lr_scale is not NotProvided:
+            self.power_lr_scale = power_lr_scale
+        if power_v_loss is not NotProvided:
+            if power_v_loss not in ("mse", "bce"):
+                raise ValueError("power_v_loss must be 'mse' or 'bce'")
+            self.power_v_loss = power_v_loss
         if power_progress_baseline is not NotProvided:
             self.power_progress_baseline = power_progress_baseline
         if power_progress_kind is not NotProvided:

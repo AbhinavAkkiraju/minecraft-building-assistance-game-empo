@@ -258,6 +258,8 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
         self.use_prev_other_agent_action = extra_config["use_prev_other_agent_action"]
         self.goal_agnostic = extra_config["goal_agnostic"]
         self.use_power_heads = extra_config["use_power_heads"]
+        self.goal_set_blocks: Optional[torch.Tensor] = None
+        self.goal_set_zeta = 2.0
         self.progress_reference: Optional[
             Union["ProgressReference", "StepsToGoalReference"]
         ] = None
@@ -828,7 +830,9 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
             goal_preds: torch.Tensor = self.goal_head(self._backbone_out)
         return goal_preds.float()
 
-    def human_goal_ability(self, possible_goal_blocks: torch.Tensor) -> torch.Tensor:
+    def human_goal_ability(
+        self, possible_goal_blocks: torch.Tensor, logits: bool = False
+    ) -> torch.Tensor:
         """
         V_h^e(s, g_h) for a batch of hypothetical possible goals (see
         mbag.rllib.alpha_zero.power). Must be called after forward(), since it
@@ -841,8 +845,11 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
                 same way as the true GOAL_BLOCKS observation channel (see
                 mbag.environment.goals.possible_goals.MinecraftStructureGoal).
 
+            logits: Return the pre-sigmoid logits instead of probabilities (for a
+                cross-entropy loss, whose gradient doesn't vanish near 0 or 1).
+
         Returns:
-            Tensor of shape (batch_size,), each entry in (0, 1).
+            Tensor of shape (batch_size,), each entry in (0, 1) (or a logit).
         """
         assert self.use_power_heads
         with self._amp_or_nothing:
@@ -850,7 +857,12 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
                 possible_goal_blocks.to(self.device).long()
             ).permute(0, 4, 1, 2, 3)
             head_input = torch.cat([self._backbone_out, embedded_goal], dim=1)
-            v_h_e: torch.Tensor = self.human_goal_ability_head(head_input)
+            head = (
+                self.human_goal_ability_head[:-1]
+                if logits
+                else self.human_goal_ability_head
+            )
+            v_h_e: torch.Tensor = head(head_input)
         return v_h_e.float().squeeze(1)
 
     def aggregate_goal_ability(self) -> torch.Tensor:
@@ -863,6 +875,8 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
             Tensor of shape (batch_size,), each entry strictly positive.
         """
         assert self.use_power_heads
+        if self.goal_set_blocks is not None:
+            return (self.goal_set_abilities() ** self.goal_set_zeta).sum(dim=1)
         with self._amp_or_nothing:
             if self.progress_reference is None:
                 x_h: torch.Tensor = self.aggregate_goal_ability_head(self._backbone_out)
@@ -877,6 +891,36 @@ class MbagTorchModel(TorchModelV2, nn.Module, ABC):
                 inverse_softplus = target + torch.log(-torch.expm1(-target))
                 x_h = nn.functional.softplus(raw + inverse_softplus)
         return x_h.float().squeeze(1)
+
+    def set_goal_set(self, goal_blocks: torch.Tensor, zeta: float):
+        """
+        Compute X_h(s) from the V_h^e head as sum over this goal set of
+        V_h^e(s, g) ** zeta (paper eq. 7) instead of using the aggregate head.
+
+        Args:
+            goal_blocks: Long tensor (N, W, H, D) of the goals' block ids.
+        """
+        self.goal_set_blocks = goal_blocks.long()
+        self.goal_set_zeta = zeta
+
+    def goal_set_abilities(self, logits: bool = False) -> torch.Tensor:
+        """
+        V_h^e(s, g) for every goal in the goal set and every state in the current
+        batch, shape (batch_size, N) (or their logits). Must be called after
+        forward().
+        """
+        assert self.goal_set_blocks is not None
+        batch_size = self._backbone_out.size()[0]
+        goal_blocks = self.goal_set_blocks.to(self._backbone_out.device)
+        return torch.stack(
+            [
+                self.human_goal_ability(
+                    goal[None].expand(batch_size, *goal.size()), logits=logits
+                )
+                for goal in goal_blocks
+            ],
+            dim=1,
+        )
 
     def set_progress_reference(
         self,

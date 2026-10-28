@@ -388,6 +388,13 @@ def sacred_config(_log):  # noqa
     power_zeta = 2.0
     power_beta_h = 10.0
     power_progress_baseline = False
+    power_simulated_x_targets = 0
+    power_simulation_horizon = 80
+    power_prior_respects_abilities = False
+    power_x_from_v = False
+    power_separate_network = False
+    power_lr_scale = 1.0
+    power_v_loss = "mse"
     power_progress_kind = "progress"
     power_goal_predicate = "exact"
     power_x_epsilon = 0.0
@@ -907,6 +914,13 @@ def sacred_config(_log):  # noqa
             power_zeta=power_zeta,
             power_beta_h=power_beta_h,
             power_progress_baseline=power_progress_baseline,
+            power_simulated_x_targets=power_simulated_x_targets,
+            power_simulation_horizon=power_simulation_horizon,
+            power_prior_respects_abilities=power_prior_respects_abilities,
+            power_x_from_v=power_x_from_v,
+            power_separate_network=power_separate_network,
+            power_lr_scale=power_lr_scale,
+            power_v_loss=power_v_loss,
             power_progress_kind=power_progress_kind,
             power_goal_predicate=power_goal_predicate,
             power_x_epsilon=power_x_epsilon,

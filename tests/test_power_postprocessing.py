@@ -223,3 +223,41 @@ class _DeterministicSampler:
 
     def sample(self, state, human_index):
         return self.goal, 1.0
+
+
+@pytest.mark.uses_rllib
+def test_aggregate_goal_ability_from_goal_set_matches_eq_7():
+    env_model = create_mbag_env_model(_make_config())
+    model = _build_model()
+    model.eval()
+    obs, _ = env_model.reset()
+    goals = torch.randint(0, 5, (3,) + WORLD_SIZE)
+    model.set_goal_set(goals, zeta=2.0)
+    with torch.no_grad():
+        model.compute_priors_and_value([obs, obs])
+        per_goal = model.goal_set_abilities()  # (2, 3)
+        x_h = model.aggregate_goal_ability()
+        manual = torch.stack(
+            [
+                model.human_goal_ability(goal[None].expand(2, *goal.size()))
+                for goal in goals
+            ],
+            dim=1,
+        )
+    assert per_goal.shape == (2, 3)
+    assert torch.allclose(per_goal, manual)
+    assert torch.allclose(x_h, (manual**2).sum(dim=1))
+
+
+@pytest.mark.uses_rllib
+def test_human_goal_ability_logits_match_probabilities():
+    env_model = create_mbag_env_model(_make_config())
+    model = _build_model()
+    model.eval()
+    obs, _ = env_model.reset()
+    goals = torch.randint(0, 5, (2,) + WORLD_SIZE)
+    with torch.no_grad():
+        model.compute_priors_and_value([obs, obs])
+        probs = model.human_goal_ability(goals)
+        logits = model.human_goal_ability(goals, logits=True)
+    assert torch.allclose(torch.sigmoid(logits), probs, atol=1e-6)

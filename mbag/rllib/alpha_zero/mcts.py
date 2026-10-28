@@ -827,9 +827,19 @@ class MbagMCTS(MCTS):
 
             aggregate_goal_abilities: Optional[np.ndarray]
             if self.use_power_reward:
-                aggregate_goal_abilities = convert_to_numpy(
-                    self.model.aggregate_goal_ability()
-                )
+                power_model = getattr(self.model, "power_model", None)
+                if power_model is not None:
+                    # Separate power network: its own forward pass on the same states.
+                    power_model.compute_priors_and_value(
+                        obs, action_mask=action_mask, prev_actions=prev_actions
+                    )
+                    aggregate_goal_abilities = convert_to_numpy(
+                        power_model.aggregate_goal_ability()
+                    )
+                else:
+                    aggregate_goal_abilities = convert_to_numpy(
+                        self.model.aggregate_goal_ability()
+                    )
             else:
                 aggregate_goal_abilities = None
 
